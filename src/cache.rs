@@ -113,7 +113,7 @@ impl MemoryQueryCache {
                 writeln!(f, "## MemoryQueryCache:")?;
                 for (fingerprint, (timestamp, record_batch)) in self.0.cache.lock().unwrap().iter() {
                     let table = pretty_format_batches(record_batch).map_err(|_| fmt::Error)?;
-                    writeln!(f, "{fingerprint}\ntimestamp: {timestamp} data:\n{table}")?;
+                    writeln!(f, "Fingerprint (cache key): {fingerprint}\ntimestamp: {timestamp} data:\n{table}")?;
                 }
                 Ok(())
             }

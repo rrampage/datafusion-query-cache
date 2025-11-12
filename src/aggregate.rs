@@ -81,12 +81,26 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         mut plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DataFusionResult<Transformed<LogicalPlan>> {
-        // println!("rewrite -> {}", plan.display());
+        let mut fingerprint = plan.display_indent_schema().to_string();
+        
+        // Log the input plan for this optimizer rule
+        log_info!(
+            self.log,
+            &fingerprint,
+            "Optimizer rule '{}' examining plan:\n{}",
+            self.name(),
+            plan.display_indent_schema()
+        );
+        
         let LogicalPlan::Aggregate(agg) = &plan else {
             // not an aggregation, continue rewrite
+            log_info!(
+                self.log,
+                &fingerprint,
+                "Plan is not an Aggregate, skipping query cache optimization"
+            );
             return Ok(Transformed::no(plan));
         };
-        let mut fingerprint = plan.display_indent_schema().to_string();
 
         let Aggregate { input, group_expr, .. } = agg;
         let agg_input = input.as_ref().clone();
@@ -201,14 +215,24 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             "query valid for caching, sort column {}",
             temporal_column
         );
-        Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+        
+        let transformed_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
                 temporal_column,
                 dynamic_lower_bound,
-                Some(fingerprint),
+                Some(fingerprint.clone()),
             )?),
-        })))
+        });
+        
+        log_info!(
+            self.log,
+            &fingerprint,
+            "Plan transformed with QueryCacheAggregate extension node:\n{}",
+            transformed_plan.display_indent_schema()
+        );
+        
+        Ok(Transformed::yes(transformed_plan))
     }
 }
 
@@ -348,8 +372,19 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
 
         let exec = physical_inputs[0].clone();
 
+        log_info!(
+            self.log,
+            &agg_node.fingerprint,
+            "Physical planner processing QueryCacheAggregate extension node"
+        );
+
         if find_existing_inner_exec(&exec) {
             // already a `QCInnerAggregateExec` (or contains a `QCInnerAggregateExec`), return it
+            log_info!(
+                self.log,
+                &agg_node.fingerprint,
+                "Physical plan already contains QueryCacheAggregateExec, reusing existing plan"
+            );
             return Ok(Some(exec));
         }
 
@@ -364,12 +399,20 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
             return Ok(Some(exec));
         };
 
+        log_info!(
+            self.log,
+            &agg_node.fingerprint,
+            "Input physical plan structure:\n  - AggregateExec mode: {:?}\n  - Aggregate expressions: {}",
+            agg_exec.mode(),
+            agg_exec.aggr_expr().len()
+        );
+
         let cache_entry = self.config.cache().entry(&agg_node.fingerprint).await?;
         log_info!(
             self.log,
             &agg_node.fingerprint,
-            "cache entry hit {:?}",
-            cache_entry.occupied()
+            "Cache lookup result: {}",
+            if cache_entry.occupied() { "HIT" } else { "MISS" }
         );
 
         let now = self.config.override_now.unwrap_or_else(|| {
@@ -385,13 +428,26 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
 
         let input_exec = match &cache_entry {
             CacheEntry::Occupied(entry) => {
+                log_info!(
+                    self.log,
+                    &agg_node.fingerprint,
+                    "Cache HIT: Using cached data from timestamp {} and new data with lower bound filter",
+                    entry.timestamp()
+                );
                 let cached_exec = CachedAggregateExec::new_exec_plan(entry.clone(), partial_agg_exec.properties());
                 let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.temporal_column, entry.timestamp())?;
 
                 let combined_input = Arc::new(UnionExec::new(vec![cached_exec, new_exec]));
                 Arc::new(CoalescePartitionsExec::new(combined_input))
             }
-            CacheEntry::Vacant(_) => partial_agg_exec,
+            CacheEntry::Vacant(_) => {
+                log_info!(
+                    self.log,
+                    &agg_node.fingerprint,
+                    "Cache MISS: No cached data available, will compute from scratch and cache result"
+                );
+                partial_agg_exec
+            }
         };
 
         // whether or not we had a cache hit, we wrap the input in a `CacheUpdateAggregateExec`
@@ -399,14 +455,22 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
         let input_exec = CacheUpdateAggregateExec::new_exec_plan(cache_entry, input_exec, now);
         let input_schema = input_exec.schema();
 
-        Ok(Some(Arc::new(AggregateExec::try_new(
+        let final_plan = Arc::new(AggregateExec::try_new(
             AggregateMode::Final,
             agg_exec.group_expr().clone(),
             agg_exec.aggr_expr().to_vec(),
             agg_exec.filter_expr().to_vec(),
             input_exec,
             input_schema,
-        )?)))
+        )?);
+
+        log_info!(
+            self.log,
+            &agg_node.fingerprint,
+            "Physical plan created: Final AggregateExec with CacheUpdateAggregateExec input"
+        );
+
+        Ok(Some(final_plan))
     }
 }
 
