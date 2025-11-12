@@ -7,14 +7,15 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{internal_err, plan_err, Column, DFSchemaRef, Result as DataFusionResult, ScalarValue};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
-    Aggregate, Between, BinaryExpr, Expr, Extension, Filter, LogicalPlan, Operator, TableScan, UserDefinedLogicalNode,
+    Aggregate, Between, BinaryExpr, Cast, Expr, Extension, Filter, LogicalPlan, Operator, TableScan, UserDefinedLogicalNode,
     UserDefinedLogicalNodeCore,
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
@@ -25,6 +26,7 @@ use datafusion::physical_expr::expressions::{
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -32,7 +34,7 @@ use datafusion::physical_plan::{collect, DisplayAs, DisplayFormatType, Execution
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::TryFutureExt;
 
-use crate::cache::{CacheEntry, OccupiedCacheEntry};
+use crate::cache::{OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
 use crate::log::{log_info, log_warn, AbstractLog};
 use crate::QueryCacheConfig;
 
@@ -117,16 +119,16 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             return Ok(Transformed::no(plan));
         }
 
-        let (dynamic_lower_bound, input) = if let LogicalPlan::Filter(filter) = &agg_input {
+        let (interval, input, temporal_columns_for_param) = if let LogicalPlan::Filter(filter) = &agg_input {
             let needle_columns = if let Some(temporal_group_by) = &temporal_group_by {
                 Cow::Owned(HashSet::from([temporal_group_by.clone()]))
             } else {
                 Cow::Borrowed(&self.config.temporal_columns)
             };
 
-            let dlb = match DynamicLowerBound::find(&filter.predicate, &needle_columns) {
-                DynamicLowerBound::Found(bin_expr) => Some(bin_expr),
-                DynamicLowerBound::Stable => None,
+            let interval = match StaticInterval::find(&filter.predicate, &needle_columns) {
+                StaticInterval::Found(interval) => Some(interval),
+                StaticInterval::Stable => None,
                 _ => {
                     // we found an unstable expression, we can't rewrite the plan
                     self.log
@@ -134,19 +136,42 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                     return Ok(Transformed::no(plan));
                 }
             };
-            (dlb, filter.input.as_ref().clone())
+            (interval, filter.input.as_ref().clone(), needle_columns.into_owned())
         } else {
-            (None, agg_input.clone())
+            (None, agg_input.clone(), HashSet::new())
+        };
+
+        // Create parameterized fingerprint for cache keying
+        let param_fingerprint = if !temporal_columns_for_param.is_empty() {
+            let normalized_plan = normalize_temporal_bounds_in_plan(&plan, &temporal_columns_for_param);
+            let param_fingerprint_str = normalized_plan.display_indent_schema().to_string();
+            // Normalize the fingerprint by removing schema-specific information from TableScan
+            normalize_fingerprint_for_caching(&param_fingerprint_str)
+        } else {
+            // Even without temporal columns, normalize for consistency
+            normalize_fingerprint_for_caching(&fingerprint)
         };
 
         if temporal_group_by.is_none() {
             // if temporal_group_by is none, we need to make sure the sort column is in the projection
-            let LogicalPlan::TableScan(scan) = input else {
+            // Find the TableScan through Filter/Projection nodes
+            let mut current_plan = input.clone();
+            let scan = loop {
+                match &current_plan {
+                    LogicalPlan::TableScan(scan) => break Some(scan.clone()),
+                    LogicalPlan::Filter(filter) => current_plan = filter.input.as_ref().clone(),
+                    LogicalPlan::Projection(proj) => current_plan = proj.input.as_ref().clone(),
+                    _ => break None,
+                }
+            };
+
+            let Some(scan) = scan else {
                 // TODO we need to support this, e.g. a subquery
                 self.log
-                    .info(&fingerprint, "input not a table scan, caching not possible")?;
+                    .info(&fingerprint, "input not a table scan (through filters/projections), caching not possible")?;
                 return Ok(Transformed::no(plan));
             };
+
             // TODO check table name
             let field_name = self.config.default_temporal_column().name.clone();
             if !scan.projected_schema.fields().iter().any(|f| f.name() == &field_name) {
@@ -195,16 +220,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             }
         }
 
-        // if dynamic_lower_bound.is_some() && temporal_group_by.is_none() {
-        //     self.log.info(
-        //         &fingerprint,
-        //         "found a dynamic lower bound but no temporal group by, caching not possible",
-        //     )?;
-        //     return Ok(Transformed::no(plan));
-        // }
-        if dynamic_lower_bound.is_some() {
-            return plan_err!("dynamic lower bound not yet supported");
-        }
+        // Static intervals are now supported
 
         let temporal_column = temporal_group_by.unwrap_or_else(|| self.config.default_temporal_column().clone());
 
@@ -220,14 +236,14 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
                 temporal_column,
-                dynamic_lower_bound,
-                Some(fingerprint.clone()),
+                interval,
+                Some(param_fingerprint.clone()),
             )?),
         });
         
         log_info!(
             self.log,
-            &fingerprint,
+            &param_fingerprint,
             "Plan transformed with QueryCacheAggregate extension node:\n{}",
             transformed_plan.display_indent_schema()
         );
@@ -241,7 +257,7 @@ struct QCAggregatePlanNode {
     input: LogicalPlan,
     fingerprint: String,
     temporal_column: Column,
-    dynamic_lower_bound: Option<BinaryExpr>,
+    interval: Option<TimeInterval>,
 }
 
 impl fmt::Display for QCAggregatePlanNode {
@@ -255,7 +271,7 @@ impl QCAggregatePlanNode {
     fn new(
         input: LogicalPlan,
         temporal_column: Column,
-        dynamic_lower_bound: Option<BinaryExpr>,
+        interval: Option<TimeInterval>,
         fingerprint: Option<String>,
     ) -> DataFusionResult<Self> {
         if let LogicalPlan::Extension(e) = input {
@@ -271,7 +287,7 @@ impl QCAggregatePlanNode {
                 input,
                 fingerprint,
                 temporal_column,
-                dynamic_lower_bound,
+                interval,
             })
         } else {
             plan_err!(
@@ -297,8 +313,9 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
 
     fn expressions(&self) -> Vec<Expr> {
         let mut expressions = vec![Expr::Column(self.temporal_column.clone())];
-        if let Some(expr) = &self.dynamic_lower_bound {
-            expressions.push(Expr::BinaryExpr(expr.clone()));
+        if let Some(interval) = &self.interval {
+            expressions.push(Expr::Literal(ScalarValue::Int64(Some(interval.start_ns))));
+            expressions.push(Expr::Literal(ScalarValue::Int64(Some(interval.end_ns))));
         }
         expressions
     }
@@ -312,16 +329,13 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
         let Some(Expr::Column(column)) = iter_exprs.next() else {
             return plan_err!("UserDefinedLogicalNodeCore  expected temporal column as first expressoin");
         };
-        let dynamic_lower_bound = if let Some(expr) = iter_exprs.next() {
+        let interval = if let (Some(Expr::Literal(ScalarValue::Int64(Some(start_ns)))), Some(Expr::Literal(ScalarValue::Int64(Some(end_ns))))) = (iter_exprs.next(), iter_exprs.next()) {
             if iter_exprs.next().is_some() {
-                return plan_err!("UserDefinedLogicalNodeCore expected one or two expressions");
+                return plan_err!("UserDefinedLogicalNodeCore expected one, two, or three expressions");
             }
-
-            if let Expr::BinaryExpr(dlb) = expr {
-                Some(dlb)
-            } else {
-                return plan_err!("UserDefinedLogicalNodeCore expected binary expression as second expression");
-            }
+            Some(TimeInterval::new(start_ns, end_ns))
+        } else if iter_exprs.next().is_some() {
+            return plan_err!("UserDefinedLogicalNodeCore expected either one column or column + two int64 literals");
         } else {
             None
         };
@@ -333,7 +347,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
         if iter_inputs.next().is_some() {
             plan_err!("UserDefinedLogicalNodeCore expected one inputs")
         } else {
-            Self::new(input, column, dynamic_lower_bound, None)
+            Self::new(input, column, interval, None)
         }
     }
 }
@@ -407,12 +421,24 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
             agg_exec.aggr_expr().len()
         );
 
-        let cache_entry = self.config.cache().entry(&agg_node.fingerprint).await?;
+        // Try to extract interval from agg_node, or from the filter predicate if not available
+        let requested_interval = if let Some(interval) = agg_node.interval {
+            interval
+        } else {
+            // Try to extract interval from the input logical plan's filter predicate
+            extract_interval_from_logical_plan(&agg_node.input, &agg_node.temporal_column)
+                .unwrap_or_else(|| TimeInterval::new(i64::MIN, i64::MAX))
+        };
+
+        println!("CACHE_DEBUG: Looking up fingerprint: '{}'", &agg_node.fingerprint);
+        let cached_intervals = self.config.cache().lookup(&agg_node.fingerprint, &requested_interval).await?;
         log_info!(
             self.log,
             &agg_node.fingerprint,
-            "Cache lookup result: {}",
-            if cache_entry.occupied() { "HIT" } else { "MISS" }
+            "Cache lookup result: found {} cached intervals for requested interval [{}, {})",
+            cached_intervals.len(),
+            requested_interval.start_ns,
+            requested_interval.end_ns
         );
 
         let now = self.config.override_now.unwrap_or_else(|| {
@@ -426,33 +452,53 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
 
         let partial_agg_exec = agg_exec.input().clone();
 
-        let input_exec = match &cache_entry {
-            CacheEntry::Occupied(entry) => {
-                log_info!(
-                    self.log,
-                    &agg_node.fingerprint,
-                    "Cache HIT: Using cached data from timestamp {} and new data with lower bound filter",
-                    entry.timestamp()
-                );
-                let cached_exec = CachedAggregateExec::new_exec_plan(entry.clone(), partial_agg_exec.properties());
-                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.temporal_column, entry.timestamp())?;
+        // Select maximal non-overlapping cached intervals by greedy algorithm
+        let selected_cached = select_maximal_cached_intervals(&cached_intervals, &requested_interval);
+        log_info!(
+            self.log,
+            &agg_node.fingerprint,
+            "Selected {} non-overlapping cached intervals from {} candidates",
+            selected_cached.len(),
+            cached_intervals.len()
+        );
 
-                let combined_input = Arc::new(UnionExec::new(vec![cached_exec, new_exec]));
-                Arc::new(CoalescePartitionsExec::new(combined_input))
-            }
-            CacheEntry::Vacant(_) => {
-                log_info!(
-                    self.log,
-                    &agg_node.fingerprint,
-                    "Cache MISS: No cached data available, will compute from scratch and cache result"
-                );
-                partial_agg_exec
-            }
+        // Compute uncovered gaps
+        let gaps = compute_gaps(&requested_interval, &selected_cached);
+        log_info!(
+            self.log,
+            &agg_node.fingerprint,
+            "Found {} uncovered gaps to compute",
+            gaps.len()
+        );
+
+        // Build execution plans for cached data and gaps
+        let mut input_plans = Vec::new();
+
+        // Add cached data readers
+        for cached_entry in &selected_cached {
+            let cached_exec = CachedAggregateExec::new_exec_plan(cached_entry.clone(), partial_agg_exec.properties());
+            input_plans.push(cached_exec);
+        }
+
+        // Add gap computation plans (wrapped in CacheUpdateAggregateExec)
+        for gap in &gaps {
+            let gap_exec = with_interval_bounds(&partial_agg_exec, &agg_node.temporal_column, gap)?;
+            let cache_update_exec = CacheUpdateAggregateExec::new_exec_plan(
+                self.config.cache().clone(),
+                &agg_node.fingerprint,
+                gap,
+                gap_exec,
+                now,
+            );
+            input_plans.push(cache_update_exec);
+        }
+
+        let input_exec = if input_plans.len() == 1 {
+            input_plans.into_iter().next().unwrap()
+        } else {
+            let union_exec = Arc::new(UnionExec::new(input_plans));
+            Arc::new(CoalescePartitionsExec::new(union_exec))
         };
-
-        // whether or not we had a cache hit, we wrap the input in a `CacheUpdateAggregateExec`
-        // to store the complete (but partial) aggregation
-        let input_exec = CacheUpdateAggregateExec::new_exec_plan(cache_entry, input_exec, now);
         let input_schema = input_exec.schema();
 
         let final_plan = Arc::new(AggregateExec::try_new(
@@ -474,70 +520,247 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
     }
 }
 
-/// apply a lower bound to an `AggregateExec`
-fn with_lower_bound(
-    partial_agg_exec: &Arc<dyn ExecutionPlan>,
-    bound_column: &Column,
-    lower_bound_ns: i64,
-) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let Some(agg_exec): Option<&AggregateExec> = partial_agg_exec.as_any().downcast_ref() else {
-        return plan_err!("expected an AggregateExec input, found {}", partial_agg_exec.name());
-    };
-
-    let find_column = agg_exec
-        .input()
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .find_map(|(id, f)| {
-            if f.name() == &bound_column.name {
-                if let DataType::Timestamp(time_unit, _) = f.data_type() {
-                    let lower_bound = match time_unit {
-                        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(lower_bound_ns), None),
-                        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(lower_bound_ns / 1000), None),
-                        TimeUnit::Millisecond => {
-                            ScalarValue::TimestampMillisecond(Some(lower_bound_ns / 1_000_000), None)
-                        }
-                        TimeUnit::Second => ScalarValue::TimestampSecond(Some(lower_bound_ns / 1_000_000_000), None),
-                    };
-                    Some((id, lower_bound))
-                } else {
-                    None
-                }
-            } else {
-                None
+/// Extract interval from a logical plan's filter predicate if available
+fn extract_interval_from_logical_plan(plan: &LogicalPlan, temporal_column: &Column) -> Option<TimeInterval> {
+    match plan {
+        LogicalPlan::Aggregate(agg) => {
+            // Look at the aggregate's input for a filter
+            extract_interval_from_logical_plan(&agg.input, temporal_column)
+        }
+        LogicalPlan::Filter(filter) => {
+            // Try to extract interval from the filter predicate
+            let temporal_columns = HashSet::from([temporal_column.clone()]);
+            match StaticInterval::find(&filter.predicate, &temporal_columns) {
+                StaticInterval::Found(interval) => Some(interval),
+                _ => None,
             }
+        }
+        LogicalPlan::Projection(proj) => {
+            // Look through projections
+            extract_interval_from_logical_plan(&proj.input, temporal_column)
+        }
+        _ => None,
+    }
+}
+
+/// Select maximal non-overlapping cached intervals using greedy algorithm
+fn select_maximal_cached_intervals(
+    cached_entries: &[Arc<dyn OccupiedIntervalCacheEntry>],
+    _requested: &TimeInterval,
+) -> Vec<Arc<dyn OccupiedIntervalCacheEntry>> {
+    // Extract intervals and sort by length descending
+    let mut intervals_with_entries: Vec<(TimeInterval, Arc<dyn OccupiedIntervalCacheEntry>)> = cached_entries
+        .iter()
+        .map(|entry| (entry.interval(), entry.clone()))
+        .collect();
+
+    intervals_with_entries.sort_by(|a, b| b.0.length().cmp(&a.0.length()));
+
+    let mut selected = Vec::new();
+    let mut covered = TimeInterval::new(i64::MAX, i64::MIN); // Empty interval initially
+
+    for (interval, entry) in intervals_with_entries {
+        // Check if this interval overlaps with any already selected
+        let overlaps_selected = selected.iter().any(|(_selected_interval, selected_entry): &(TimeInterval, Arc<dyn OccupiedIntervalCacheEntry>)| {
+            selected_entry.interval().overlaps(&interval)
         });
 
-    let Some((column_id, lower_bound_scalar)) = find_column else {
-        return plan_err!("Timestamp column '{}' not found in input schema", bound_column.name);
+        if !overlaps_selected {
+            selected.push((interval, entry));
+            // Update covered range
+            covered.start_ns = covered.start_ns.min(interval.start_ns);
+            covered.end_ns = covered.end_ns.max(interval.end_ns);
+        }
+    }
+
+    selected.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Compute gaps between requested interval and selected cached intervals
+fn compute_gaps(
+    requested: &TimeInterval,
+    selected_cached: &[Arc<dyn OccupiedIntervalCacheEntry>],
+) -> Vec<TimeInterval> {
+    if selected_cached.is_empty() {
+        return vec![*requested];
+    }
+
+    // Get all cached intervals sorted by start time
+    let mut cached_intervals: Vec<TimeInterval> = selected_cached
+        .iter()
+        .map(|entry| entry.interval())
+        .collect();
+    cached_intervals.sort_by_key(|i| i.start_ns);
+
+    let mut gaps = Vec::new();
+
+    // Gap before first cached interval
+    if cached_intervals[0].start_ns > requested.start_ns {
+        gaps.push(TimeInterval::new(requested.start_ns, cached_intervals[0].start_ns));
+    }
+
+    // Gaps between cached intervals
+    for i in 0..cached_intervals.len() - 1 {
+        let current_end = cached_intervals[i].end_ns;
+        let next_start = cached_intervals[i + 1].start_ns;
+        if current_end < next_start {
+            gaps.push(TimeInterval::new(current_end, next_start));
+        }
+    }
+
+    // Gap after last cached interval
+    if cached_intervals.last().unwrap().end_ns < requested.end_ns {
+        gaps.push(TimeInterval::new(cached_intervals.last().unwrap().end_ns, requested.end_ns));
+    }
+
+    gaps
+}
+
+/// apply interval bounds to an `AggregateExec`
+fn with_interval_bounds(
+    partial_agg_exec: &Arc<dyn ExecutionPlan>,
+    bound_column: &Column,
+    interval: &TimeInterval,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    // For gap computation, we need to apply the interval bounds to the data source.
+    // If partial_agg_exec is an AggregateExec, we apply the filter to its input.
+    // If the input is a ProjectionExec with empty projection, we apply the filter to its input.
+    let (plan_to_filter, column_offset) = if let Some(agg_exec) = partial_agg_exec.as_any().downcast_ref::<AggregateExec>() {
+        // Find where to apply the filter
+        let input = agg_exec.input();
+        if let Some(proj_exec) = input.as_any().downcast_ref::<ProjectionExec>() {
+            // If the input is a projection with empty projection, apply filter to its input
+            if proj_exec.expr().is_empty() {
+                (proj_exec.input().clone(), 0)
+            } else {
+                // Projection has expressions, apply filter to the projection
+                (input.clone(), 0)
+            }
+        } else {
+            // Apply filter to the aggregate input
+            (input.clone(), 0)
+        }
+    } else {
+        // Not an AggregateExec, apply filter directly
+        (partial_agg_exec.clone(), 0)
+    };
+
+    // Find the column in the plan_to_filter
+    let find_column_result = find_timestamp_column_in_plan(&plan_to_filter, bound_column);
+
+    let (column_id, time_unit) = match find_column_result {
+        Some(result) => result,
+        None => return plan_err!("Timestamp column '{}' not found in plan", bound_column.name),
+    };
+
+    // Convert nanosecond bounds to appropriate time unit
+    let (lower_bound, upper_bound) = match time_unit {
+        TimeUnit::Nanosecond => (
+            ScalarValue::TimestampNanosecond(Some(interval.start_ns), None),
+            ScalarValue::TimestampNanosecond(Some(interval.end_ns), None),
+        ),
+        TimeUnit::Microsecond => (
+            ScalarValue::TimestampMicrosecond(Some(interval.start_ns / 1000), None),
+            ScalarValue::TimestampMicrosecond(Some(interval.end_ns / 1000), None),
+        ),
+        TimeUnit::Millisecond => (
+            ScalarValue::TimestampMillisecond(Some(interval.start_ns / 1_000_000), None),
+            ScalarValue::TimestampMillisecond(Some(interval.end_ns / 1_000_000), None),
+        ),
+        TimeUnit::Second => (
+            ScalarValue::TimestampSecond(Some(interval.start_ns / 1_000_000_000), None),
+            ScalarValue::TimestampSecond(Some(interval.end_ns / 1_000_000_000), None),
+        ),
     };
 
     let lower_bound_predicate = Arc::new(PhysicalBinaryExpr::new(
-        Arc::new(PhysicalColumn::new(&bound_column.name, column_id)),
+        Arc::new(PhysicalColumn::new(&bound_column.name, column_id + column_offset)),
         Operator::GtEq,
-        Arc::new(PhysicalLiteral::new(lower_bound_scalar)),
+        Arc::new(PhysicalLiteral::new(lower_bound)),
     ));
-    let filter_exec = if let Some(filter) = agg_exec.input().as_any().downcast_ref::<FilterExec>() {
-        let new_predicate = PhysicalBinaryExpr::new(filter.predicate().clone(), Operator::And, lower_bound_predicate);
+
+    let upper_bound_predicate = Arc::new(PhysicalBinaryExpr::new(
+        Arc::new(PhysicalColumn::new(&bound_column.name, column_id + column_offset)),
+        Operator::Lt,
+        Arc::new(PhysicalLiteral::new(upper_bound)),
+    ));
+
+    let interval_predicate = Arc::new(PhysicalBinaryExpr::new(
+        lower_bound_predicate,
+        Operator::And,
+        upper_bound_predicate,
+    ));
+
+    // Create new filter
+    let new_filter_exec = if let Some(filter) = plan_to_filter.as_any().downcast_ref::<FilterExec>() {
+        let new_predicate = PhysicalBinaryExpr::new(filter.predicate().clone(), Operator::And, interval_predicate);
         let new_filter = FilterExec::try_new(Arc::new(new_predicate), filter.input().clone())?;
         new_filter.with_projection(filter.projection().cloned())?
     } else {
-        FilterExec::try_new(lower_bound_predicate, agg_exec.input().clone())?
+        FilterExec::try_new(interval_predicate, plan_to_filter)?
     };
 
-    let input_schema = filter_exec.schema();
+    // Now reconstruct the plan with the new filter
+    if let Some(agg_exec) = partial_agg_exec.as_any().downcast_ref::<AggregateExec>() {
+        let input = agg_exec.input();
+        let new_input: Arc<dyn ExecutionPlan> = if let Some(proj_exec) = input.as_any().downcast_ref::<ProjectionExec>() {
+            if proj_exec.expr().is_empty() {
+                // Replace the projection's input with the new filter
+                Arc::new(ProjectionExec::try_new(proj_exec.expr().to_vec(), Arc::new(new_filter_exec))?)
+            } else {
+                // The projection has expressions, so apply filter to it
+                Arc::new(ProjectionExec::try_new(proj_exec.expr().to_vec(), Arc::new(new_filter_exec))?)
+            }
+        } else {
+            // The aggregate input is not a projection, replace it with the new filter
+            Arc::new(new_filter_exec)
+        };
 
-    Ok(Arc::new(AggregateExec::try_new(
-        *agg_exec.mode(),
-        agg_exec.group_expr().clone(),
-        agg_exec.aggr_expr().to_vec(),
-        agg_exec.filter_expr().to_vec(),
-        Arc::new(filter_exec),
-        input_schema,
-    )?))
+        let input_schema = new_input.schema();
+        Ok(Arc::new(AggregateExec::try_new(
+            *agg_exec.mode(),
+            agg_exec.group_expr().clone(),
+            agg_exec.aggr_expr().to_vec(),
+            agg_exec.filter_expr().to_vec(),
+            new_input,
+            input_schema,
+        )?))
+    } else {
+        Ok(Arc::new(new_filter_exec))
+    }
 }
+
+/// Find timestamp column in the execution plan by traversing through projections and filters
+fn find_timestamp_column_in_plan(plan: &Arc<dyn ExecutionPlan>, column: &Column) -> Option<(usize, TimeUnit)> {
+    // Check current plan's schema
+    if let Some(result) = find_column_in_schema(&plan.schema(), column) {
+        return Some(result);
+    }
+
+    // Traverse through child plans
+    for child in plan.children() {
+        if let Some(result) = find_timestamp_column_in_plan(child, column) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+fn find_column_in_schema(schema: &datafusion::arrow::datatypes::Schema, column: &Column) -> Option<(usize, TimeUnit)> {
+    schema.fields().iter().enumerate().find_map(|(id, f)| {
+        if f.name() == &column.name {
+            if let DataType::Timestamp(time_unit, _) = f.data_type() {
+                Some((id, *time_unit))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    })
+}
+
 
 /// check for an existing `QCInnerAggregateExec` in the plan
 fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
@@ -561,8 +784,10 @@ fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
 
 /// A wrapper for `AggregateExec` that caches the result of the aggregation
 #[derive(Debug)]
-struct CacheUpdateAggregateExec {
-    cache_entry: CacheEntry,
+pub struct CacheUpdateAggregateExec {
+    fingerprint: String,
+    interval: TimeInterval,
+    cache: Arc<dyn QueryCache>,
     input: Arc<dyn ExecutionPlan>,
     /// from `session_state.execution_props().query_execution_start_time.timestamp_nanos_opt()`
     now: i64,
@@ -571,7 +796,13 @@ struct CacheUpdateAggregateExec {
 }
 
 impl CacheUpdateAggregateExec {
-    fn new_exec_plan(cache_entry: CacheEntry, input: Arc<dyn ExecutionPlan>, now: i64) -> Arc<dyn ExecutionPlan> {
+    fn new_exec_plan(
+        cache: Arc<dyn QueryCache>,
+        fingerprint: &str,
+        interval: &TimeInterval,
+        input: Arc<dyn ExecutionPlan>,
+        now: i64
+    ) -> Arc<dyn ExecutionPlan> {
         // we need one partition so we can store one result in the cache, use `CoalescePartitionsExec`
         // if input is not already one
         let input = if input.name() == "CoalescePartitionsExec" {
@@ -582,12 +813,19 @@ impl CacheUpdateAggregateExec {
         let properties = input.properties().clone();
 
         Arc::new(Self {
-            cache_entry,
+            fingerprint: fingerprint.to_string(),
+            interval: *interval,
+            cache,
             input,
             now,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Returns the time interval this cache update execution covers
+    pub fn interval(&self) -> TimeInterval {
+        self.interval
     }
 }
 
@@ -595,7 +833,7 @@ impl DisplayAs for CacheUpdateAggregateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
-            DisplayFormatType::Verbose => write!(f, "{self:?}"),
+            DisplayFormatType::Verbose => write!(f, "{} {{ interval: {:?}, input: {} }}", self.name(), self.interval(), self.input.name()),
         }
     }
 }
@@ -624,7 +862,9 @@ impl ExecutionPlan for CacheUpdateAggregateExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
             Ok(Self::new_exec_plan(
-                self.cache_entry.clone(), // TODO is it safe to reuse the cache entry?
+                self.cache.clone(),
+                &self.fingerprint,
+                &self.interval,
                 children[0].clone(),
                 self.now,
             ))
@@ -638,7 +878,15 @@ impl ExecutionPlan for CacheUpdateAggregateExec {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.input.schema(),
-            execute_store(self.input.clone(), self.cache_entry.clone(), self.now, context, metrics)
+            execute_store(
+                self.cache.clone(),
+                self.fingerprint.clone(),
+                self.interval,
+                self.input.clone(),
+                self.now,
+                context,
+                metrics
+            )
                 .map_ok(|partitions| futures::stream::iter(partitions.into_iter().map(Ok)))
                 .try_flatten_stream(),
         )))
@@ -650,15 +898,17 @@ impl ExecutionPlan for CacheUpdateAggregateExec {
 }
 
 async fn execute_store(
+    cache: Arc<dyn QueryCache>,
+    fingerprint: String,
+    interval: TimeInterval,
     input: Arc<dyn ExecutionPlan>,
-    cache_entry: CacheEntry,
-    now: i64,
+    _now: i64,
     context: Arc<TaskContext>,
     metrics: BaselineMetrics,
 ) -> DataFusionResult<Vec<RecordBatch>> {
     let batches = collect(input, context).await?;
     // store the result for future use
-    cache_entry.put(now, &batches).await?;
+    cache.put(&fingerprint, interval, &batches).await?;
     metrics.record_output(batches.iter().map(RecordBatch::num_rows).sum());
     metrics.done();
     Ok(batches)
@@ -666,8 +916,8 @@ async fn execute_store(
 
 /// A wrapper for `AggregateExec` that caches the result of the aggregation
 #[derive(Debug)]
-struct CachedAggregateExec {
-    cache_entry: Arc<dyn OccupiedCacheEntry>,
+pub struct CachedAggregateExec {
+    cache_entry: Arc<dyn OccupiedIntervalCacheEntry>,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -675,7 +925,7 @@ struct CachedAggregateExec {
 
 impl CachedAggregateExec {
     fn new_exec_plan(
-        cache_entry: Arc<dyn OccupiedCacheEntry>,
+        cache_entry: Arc<dyn OccupiedIntervalCacheEntry>,
         inner_properties: &PlanProperties,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(Self {
@@ -685,13 +935,18 @@ impl CachedAggregateExec {
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+
+    /// Returns the time interval this cached execution covers
+    pub fn interval(&self) -> TimeInterval {
+        self.cache_entry.interval()
+    }
 }
 
 impl DisplayAs for CachedAggregateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}", self.name()),
-            DisplayFormatType::Verbose => write!(f, "{self:?}"),
+            DisplayFormatType::Verbose => write!(f, "{} {{ interval: {:?} }}", self.name(), self.interval()),
         }
     }
 }
@@ -742,7 +997,7 @@ impl ExecutionPlan for CachedAggregateExec {
 }
 
 async fn execute_get(
-    cache_entry: Arc<dyn OccupiedCacheEntry>,
+    cache_entry: Arc<dyn OccupiedIntervalCacheEntry>,
     metrics: BaselineMetrics,
 ) -> DataFusionResult<Vec<RecordBatch>> {
     let batches = cache_entry.get().await.map(<[RecordBatch]>::to_vec)?;
@@ -751,123 +1006,283 @@ async fn execute_get(
     Ok(batches)
 }
 
-/// Find a binary expression which must have the form `{column} >(=) {something with now()}` represents a
-/// lower bound on `column` but changes over time.
-#[derive(Debug)]
-enum DynamicLowerBound {
-    /// we found an unstable expression which means we can't rewrite the plan
-    Abandon,
-    /// we found a suitable lower bound
-    Found(BinaryExpr),
-    /// we found `now()` or similar function which is allowed if within an expression which sets the lower bound
-    FoundNow,
-    /// we did not find a suitable lower bound, but the expression is stable
-    Stable,
+/// Normalize temporal bounds in expressions by replacing literals with placeholders
+/// Public for testing purposes
+pub fn normalize_temporal_bounds_in_expr(expr: &Expr, temporal_columns: &HashSet<Column>) -> Expr {
+    match expr {
+        Expr::BinaryExpr(bin_expr) => {
+            let BinaryExpr { left, op, right } = bin_expr;
+
+            // Check if this is a temporal comparison
+            let is_temporal_comparison = match (left.as_ref(), op) {
+                (Expr::Column(col), Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq) => {
+                    temporal_columns.contains(col)
+                }
+                _ => false,
+            };
+
+            if is_temporal_comparison {
+                // Replace the literal with a placeholder
+                let placeholder = Expr::Literal(ScalarValue::Utf8(Some("?".to_string())));
+                let normalized_right = if matches!(right.as_ref(), Expr::Literal(_)) {
+                    placeholder
+                } else {
+                    normalize_temporal_bounds_in_expr(right, temporal_columns)
+                };
+                Expr::BinaryExpr(BinaryExpr {
+                    left: left.clone(),
+                    op: *op,
+                    right: Box::new(normalized_right),
+                })
+            } else {
+                // Recursively normalize both sides
+                Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(normalize_temporal_bounds_in_expr(left, temporal_columns)),
+                    op: *op,
+                    right: Box::new(normalize_temporal_bounds_in_expr(right, temporal_columns)),
+                })
+            }
+        }
+        Expr::Between(between) => {
+            let Between { expr, negated, low, high } = between;
+
+            // Check if this is a temporal BETWEEN
+            let is_temporal_between = if let Expr::Column(col) = expr.as_ref() {
+                temporal_columns.contains(col)
+            } else {
+                false
+            };
+
+            if is_temporal_between {
+                // Replace literals with placeholders
+                let placeholder = Expr::Literal(ScalarValue::Utf8(Some("?".to_string())));
+                let normalized_low = if matches!(low.as_ref(), Expr::Literal(_)) {
+                    placeholder.clone()
+                } else {
+                    normalize_temporal_bounds_in_expr(low, temporal_columns)
+                };
+                let normalized_high = if matches!(high.as_ref(), Expr::Literal(_)) {
+                    placeholder
+                } else {
+                    normalize_temporal_bounds_in_expr(high, temporal_columns)
+                };
+
+                Expr::Between(Between {
+                    expr: expr.clone(),
+                    negated: *negated,
+                    low: Box::new(normalized_low),
+                    high: Box::new(normalized_high),
+                })
+            } else {
+                // Recursively normalize
+                Expr::Between(Between {
+                    expr: Box::new(normalize_temporal_bounds_in_expr(expr, temporal_columns)),
+                    negated: *negated,
+                    low: Box::new(normalize_temporal_bounds_in_expr(low, temporal_columns)),
+                    high: Box::new(normalize_temporal_bounds_in_expr(high, temporal_columns)),
+                })
+            }
+        }
+        // For other expression types, recursively normalize
+        Expr::Not(e) => Expr::Not(Box::new(normalize_temporal_bounds_in_expr(e, temporal_columns))),
+        Expr::Negative(e) => Expr::Negative(Box::new(normalize_temporal_bounds_in_expr(e, temporal_columns))),
+        Expr::ScalarFunction(func) => {
+            let args = func.args.iter()
+                .map(|arg| normalize_temporal_bounds_in_expr(arg, temporal_columns))
+                .collect();
+            Expr::ScalarFunction(ScalarFunction {
+                func: func.func.clone(),
+                args,
+            })
+        }
+        // For literals, columns, and other types, return as-is
+        _ => expr.clone(),
+    }
 }
 
-impl DynamicLowerBound {
+/// Normalize temporal bounds in a logical plan for fingerprinting
+/// Public for testing purposes
+pub fn normalize_temporal_bounds_in_plan(plan: &LogicalPlan, temporal_columns: &HashSet<Column>) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            let normalized_predicate = normalize_temporal_bounds_in_expr(&filter.predicate, temporal_columns);
+            LogicalPlan::Filter(Filter::try_new(
+                normalized_predicate,
+                Arc::new(normalize_temporal_bounds_in_plan(filter.input.as_ref(), temporal_columns)),
+            ).expect("Failed to create normalized filter"))
+        }
+        LogicalPlan::Aggregate(agg) => {
+            let normalized_group_expr = agg.group_expr.iter()
+                .map(|expr| normalize_temporal_bounds_in_expr(expr, temporal_columns))
+                .collect();
+            let normalized_aggr_expr = agg.aggr_expr.iter()
+                .map(|expr| normalize_temporal_bounds_in_expr(expr, temporal_columns))
+                .collect();
+            LogicalPlan::Aggregate(Aggregate::try_new(
+                Arc::new(normalize_temporal_bounds_in_plan(agg.input.as_ref(), temporal_columns)),
+                normalized_group_expr,
+                normalized_aggr_expr,
+            ).expect("Failed to create normalized aggregate"))
+        }
+        // For other plan types, return as-is (we only normalize expressions in aggregations with filters)
+        _ => plan.clone(),
+    }
+}
+
+/// Normalize a fingerprint string for consistent caching by removing schema-specific details
+fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
+    let mut result = fingerprint.to_string();
+
+    // Replace timestamp literals with placeholders
+    let timestamp_re = regex::Regex::new(r"TimestampMicrosecond\(\d+,\s*None\)").unwrap();
+    result = timestamp_re.replace_all(&result, "TimestampMicrosecond(?, None)").to_string();
+
+    // Replace string timestamp literals
+    let string_timestamp_re = regex::Regex::new(r"Utf8\([^)]+\)").unwrap();
+    result = string_timestamp_re.replace_all(&result, "Utf8(?)").to_string();
+
+    // Replace TableScan schema information with a canonical representation
+    let table_scan_re = regex::Regex::new(r"TableScan: \w+ \[[^\]]+\]").unwrap();
+    result = table_scan_re.replace_all(&result, "TableScan: $table [normalized_schema]").to_string();
+
+    result
+}
+
+/// Extract static time intervals from expressions (e.g., BETWEEN, >=, <=)
+#[derive(Debug)]
+enum StaticInterval {
+    /// Found a complete static interval
+    Found(TimeInterval),
+    /// Expression is stable but doesn't define a complete interval
+    Stable,
+    /// Expression contains dynamic elements or is unsupported
+    Abandon,
+}
+
+impl StaticInterval {
     fn find(expr: &Expr, columns: &HashSet<Column>) -> Self {
         match expr {
             Expr::BinaryExpr(bin_expr) => Self::find_bin_expr(bin_expr, columns),
             Expr::Between(between) => Self::find_between(between, columns),
-            Expr::Literal(_)
-            | Expr::Like(_)
-            | Expr::IsNotNull(_)
-            | Expr::IsNull(_)
-            | Expr::IsTrue(_)
-            | Expr::IsFalse(_)
-            | Expr::IsNotTrue(_)
-            | Expr::IsNotFalse(_)
-            | Expr::Column(_) => Self::Stable,
+            Expr::Literal(_) | Expr::Column(_) => Self::Stable,
             Expr::Not(e) | Expr::Negative(e) => match Self::find(e, columns) {
                 Self::Stable => Self::Stable,
                 _ => Self::Abandon,
             },
             Expr::ScalarFunction(scalar) => Self::find_scalar_function(scalar),
-            // TODO there are other allowed cases
             _ => Self::Abandon,
         }
     }
 
     fn find_bin_expr(bin_expr: &BinaryExpr, columns: &HashSet<Column>) -> Self {
         let BinaryExpr { left, op, right } = bin_expr;
+
         match op {
             Operator::Gt | Operator::GtEq => {
-                // expression of the form `left >(=) right`, for this to be a lower bound:
-                // `left` must be the column
-                // and `right` must be a dynamic bound
                 if let Expr::Column(col) = left.as_ref() {
                     if columns.contains(col) {
-                        return match Self::find(right, columns) {
-                            Self::Stable => Self::Stable,
-                            Self::FoundNow => Self::Found(bin_expr.clone()),
-                            _ => Self::Abandon,
-                        };
+                        if let Some(lower_ns) = Self::extract_timestamp_ns(right) {
+                            let start_ns = if *op == Operator::Gt { lower_ns + 1 } else { lower_ns };
+                            return Self::Found(TimeInterval::new(start_ns, i64::MAX));
+                        }
                     }
                 }
             }
             Operator::Lt | Operator::LtEq => {
-                // expression of the form `left <(=) right`, for this to be a lower bound:
-                // `left` must be a dynamic bound
-                // and `right` must be the column
-                if let Expr::Column(col) = right.as_ref() {
+                if let Expr::Column(col) = left.as_ref() {
                     if columns.contains(col) {
-                        return match Self::find(left, columns) {
-                            Self::Stable => Self::Stable,
-                            Self::FoundNow => {
-                                let op = match op {
-                                    Operator::Lt => Operator::GtEq,
-                                    Operator::LtEq => Operator::Gt,
-                                    _ => unreachable!(),
-                                };
-                                Self::Found(BinaryExpr {
-                                    right: left.clone(),
-                                    op,
-                                    left: right.clone(),
-                                })
-                            }
-                            _ => Self::Abandon,
-                        };
+                        if let Some(upper_ns) = Self::extract_timestamp_ns(right) {
+                            let end_ns = if *op == Operator::Lt { upper_ns } else { upper_ns + 1 };
+                            return Self::Found(TimeInterval::new(i64::MIN, end_ns));
+                        }
                     }
                 }
             }
-            // AND or a simple arithmetic operation, check both sides
-            Operator::And
-            | Operator::Eq
-            | Operator::Plus
-            | Operator::Minus
-            | Operator::Multiply
-            | Operator::Divide
-            | Operator::Modulo => (),
-            _ => return Self::Abandon,
-        };
+            Operator::And => {
+                // Try to combine bounds from both sides
+                let left_result = Self::find(left, columns);
+                let right_result = Self::find(right, columns);
 
+                return match (left_result, right_result) {
+                    (Self::Found(left_int), Self::Found(right_int)) => {
+                        // Combine the intervals
+                        let start_ns = left_int.start_ns.max(right_int.start_ns);
+                        let end_ns = left_int.end_ns.min(right_int.end_ns);
+                        if start_ns < end_ns {
+                            Self::Found(TimeInterval::new(start_ns, end_ns))
+                        } else {
+                            Self::Abandon // Invalid interval
+                        }
+                    }
+                    (Self::Found(int), Self::Stable) | (Self::Stable, Self::Found(int)) => Self::Found(int),
+                    (Self::Stable, Self::Stable) => Self::Stable,
+                    _ => Self::Abandon,
+                };
+            }
+            _ => return Self::Abandon,
+        }
+
+        // For other operators, check both sides
         let left = Self::find(left, columns);
         let right = Self::find(right, columns);
         left.either(right)
     }
 
-    fn find_between(_between: &Between, _columns: &HashSet<Column>) -> Self {
-        todo!()
+    fn find_between(between: &Between, columns: &HashSet<Column>) -> Self {
+        if let Expr::Column(ref col) = *between.expr {
+            if !columns.contains(col) {
+                return Self::Stable;
+            }
+        } else {
+            return Self::Abandon;
+        }
+
+        let Some(lower_ns) = Self::extract_timestamp_ns(&between.low) else {
+            return Self::Abandon;
+        };
+        let Some(upper_ns) = Self::extract_timestamp_ns(&between.high) else {
+            return Self::Abandon;
+        };
+
+        // BETWEEN is inclusive, so convert to half-open [lower, upper+1)
+        Self::Found(TimeInterval::new(lower_ns, upper_ns + 1))
     }
 
-    fn find_scalar_function(scalar: &ScalarFunction) -> Self {
-        if matches!(scalar.name(), "now" | "current_timestamp" | "current_date") {
-            Self::FoundNow
-        } else {
-            Self::Abandon
+    fn find_scalar_function(_scalar: &ScalarFunction) -> Self {
+        // Static functions are not supported for interval caching
+        Self::Abandon
+    }
+
+    fn extract_timestamp_ns(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(ns), _)) => Some(*ns),
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us * 1_000),
+            Expr::Literal(ScalarValue::TimestampMillisecond(Some(ms), _)) => Some(ms * 1_000_000),
+            Expr::Literal(ScalarValue::TimestampSecond(Some(s), _)) => Some(s * 1_000_000_000),
+            // Handle cast expressions: CAST(string_literal AS TIMESTAMP)
+            Expr::Cast(cast) => {
+                if let Expr::Literal(ScalarValue::Utf8(Some(timestamp_str))) = cast.expr.as_ref() {
+                    // Try to parse as RFC3339 timestamp
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str) {
+                        dt.timestamp_nanos_opt().map(|ns| ns)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
     /// Find the value which is more important
-    #[allow(clippy::match_same_arms)]
     fn either(self, other: Self) -> Self {
         match (self, other) {
             (Self::Abandon, _) | (_, Self::Abandon) => Self::Abandon,
-            // found on both sides, not sure what to do
-            (Self::Found(..), Self::Found(..)) => Self::Abandon,
-            (Self::FoundNow, _) | (_, Self::FoundNow) => Self::FoundNow,
-            (Self::Stable, other) | (other, Self::Stable) => other,
+            (Self::Found(int), _) | (_, Self::Found(int)) => Self::Found(int),
+            (Self::Stable, Self::Stable) => Self::Stable,
         }
     }
 }
+
