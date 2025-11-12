@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    // Initialize the query cache
     let cache = Arc::new(MemoryQueryCache::default());
 
     let divide = DateTime::parse_from_rfc3339("2024-01-01T17:18:19Z").unwrap();

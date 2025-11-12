@@ -12,6 +12,23 @@ pub trait QueryCache: Send + Sync + fmt::Debug {
     async fn entry(&self, query_fingerprint: &str) -> DataFusionResult<CacheEntry>;
 }
 
+pub async fn print_cache_state<C: QueryCache>(cache: &C, fingerprint: &str) -> DataFusionResult<()> {
+    match cache.entry(fingerprint).await? {
+        CacheEntry::Vacant(_) => {
+            println!("Cache[{}] = <empty>", fingerprint);
+        }
+        CacheEntry::Occupied(entry) => {
+            let ts = entry.timestamp();
+            let batches = entry.get().await?;
+            println!("Cache[{}] = timestamp={} batches={}", fingerprint, ts, batches.len());
+            for (i, batch) in batches.iter().enumerate() {
+                println!("  batch[{}]: {:?}", i, batch);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub enum CacheEntry {
     Occupied(Arc<dyn OccupiedCacheEntry>),
