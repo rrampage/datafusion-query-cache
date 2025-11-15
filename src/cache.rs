@@ -111,12 +111,22 @@ impl fmt::Debug for MemoryQueryCache {
 pub fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
     let mut result = fingerprint.to_string();
 
-    // Replace timestamp literals with placeholders
-    let timestamp_re = regex::Regex::new(r"TimestampNanosecond\(\d+,\s*None\)").unwrap();
-    result = timestamp_re.replace_all(&result, "TimestampNanosecond(?, None)").to_string();
+    // Replace timestamp literals with placeholders, keeping timezone normalization
+    let timestamp_ns_re = regex::Regex::new(
+        r#"TimestampNanosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#,
+    )
+    .unwrap();
+    result = timestamp_ns_re
+        .replace_all(&result, "TimestampNanosecond(?, None)")
+        .to_string();
 
-    let timestamp_re = regex::Regex::new(r"TimestampMicrosecond\(\d+,\s*None\)").unwrap();
-    result = timestamp_re.replace_all(&result, "TimestampMicrosecond(?, None)").to_string();
+    let timestamp_us_re = regex::Regex::new(
+        r#"TimestampMicrosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#,
+    )
+    .unwrap();
+    result = timestamp_us_re
+        .replace_all(&result, "TimestampMicrosecond(?, None)")
+        .to_string();
 
     // Replace string timestamp literals
     let string_timestamp_re = regex::Regex::new(r"Utf8\([^)]+\)").unwrap();

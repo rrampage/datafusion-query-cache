@@ -10,7 +10,8 @@
 6. [Detailed Stage Explanations](#detailed-stage-explanations)
 7. [Query Plan Comparison](#query-plan-comparison)
 8. [Implementation Details](#implementation-details)
-9. [Code Reference Guide](#code-reference-guide)
+9. [Known Issues and Fixes](#known-issues-and-fixes)
+10. [Code Reference Guide](#code-reference-guide)
 
 ---
 
@@ -1983,6 +1984,38 @@ On query: Union all three entries
 
 ---
 
+## Known Issues and Fixes
+
+### Timezone-Aware Timestamp Columns
+
+**Issue**: When using timestamp columns with timezone information (e.g., `Timestamp(Microsecond, Some("UTC"))`), the query cache would fail with comparison errors:
+
+```
+Error: Some(Arrow { source: InvalidArgumentError("Invalid comparison operation: Timestamp(Microsecond, Some(\"UTC\")) >= Timestamp(Microsecond, None)") })
+```
+
+**Root Cause**: The cache was generating interval bounds using `ScalarValue::Timestamp*` literals with `None` as the timezone, but comparing against columns with timezone information (`Some("UTC")`) would fail due to type incompatibility.
+
+**Fix Applied**:
+
+1. **Interval Bound Generation** (`src/aggregate.rs`):
+   - Modified `find_timestamp_column_in_plan()` and `find_column_in_schema()` to return the column's timezone information
+   - Updated `with_interval_bounds()` to propagate the detected timezone when creating `ScalarValue::Timestamp*` literals
+   - Changed return types from `Option<(usize, TimeUnit)>` to `Option<(usize, TimeUnit, Option<Arc<str>>)>`
+
+2. **Fingerprint Normalization** (`src/cache.rs`):
+   - Updated `normalize_fingerprint_for_caching()` to handle timezone-aware timestamp literals in fingerprints
+   - Modified regex patterns to match both `None` and `Some("timezone")` formats:
+     ```rust
+     // Before: r"TimestampMicrosecond\(\d+,\s*None\)"
+     // After:  r#"TimestampMicrosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#
+     ```
+   - Ensures cache keys remain consistent regardless of timezone information
+
+**Result**: The cache now properly handles timezone-aware timestamp columns while maintaining cache key consistency for fingerprint-based lookups.
+
+---
+
 ## Code Reference Guide
 
 ### Key Files
@@ -1993,7 +2026,7 @@ On query: Union all three entries
    - `with_query_cache()`: Integration function
    - `QueryCacheQueryPlanner`: Custom query planner implementation
 
-2. **[`src/aggregate.rs`](../src/aggregate.rs)** (874 lines)
+2. **[`src/aggregate.rs`](../src/aggregate.rs)** (1302 lines)
    - Core caching logic
    - `QCAggregateOptimizerRule`: Logical plan optimizer
    - `QCAggregatePlanNode`: Extension logical node
@@ -2002,7 +2035,7 @@ On query: Union all three entries
    - `CacheUpdateAggregateExec`: Cache write executor
    - `DynamicLowerBound`: Time-based filter analysis
 
-3. **[`src/cache.rs`](../src/cache.rs)** (194 lines)
+3. **[`src/cache.rs`](../src/cache.rs)** (230 lines)
    - Cache abstraction traits
    - `QueryCache`: Main cache interface
    - `CacheEntry`, `OccupiedCacheEntry`, `VacantCacheEntry`: Entry types

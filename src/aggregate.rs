@@ -32,6 +32,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use datafusion::physical_plan::Partitioning;
 use futures::TryFutureExt;
 
 use crate::cache::{normalize_fingerprint_for_caching, OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
@@ -957,10 +958,11 @@ impl CachedAggregateExec {
         cache_entry: Arc<dyn OccupiedIntervalCacheEntry>,
         inner_properties: &PlanProperties,
     ) -> Arc<dyn ExecutionPlan> {
+        let plan_props = inner_properties.clone().with_partitioning(Partitioning::UnknownPartitioning(1));
         Arc::new(Self {
             cache_entry,
             schema: inner_properties.eq_properties.schema().clone(),
-            properties: inner_properties.clone(),
+            properties: plan_props,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
