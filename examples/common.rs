@@ -65,13 +65,13 @@ pub fn create_time_series_data(start: DateTime<FixedOffset>, stop: DateTime<Fixe
         Field::new("status_code", DataType::Int64, true),
     ]));
 
-    let mut timestamp = start.timestamp();
+    let mut timestamp = start.timestamp_nanos_opt().unwrap();
     let mut timestamps = Vec::new();
     let mut services = Vec::new();
     let mut response_times = Vec::new();
     let mut status_codes = Vec::new();
 
-    let end = stop.timestamp();
+    let end = stop.timestamp_nanos_opt().unwrap();
 
     let mut seed = 0u64;
     while timestamp < end {

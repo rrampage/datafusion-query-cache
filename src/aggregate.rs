@@ -119,6 +119,8 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             return Ok(Transformed::no(plan));
         }
 
+        println!("BBBB TEMPORALCOLUMN: {:?}", &self.config.default_temporal_column());
+
         let (interval, input, temporal_columns_for_param) = if let LogicalPlan::Filter(filter) = &agg_input {
             let needle_columns = if let Some(temporal_group_by) = &temporal_group_by {
                 Cow::Owned(HashSet::from([temporal_group_by.clone()]))
@@ -651,28 +653,49 @@ fn with_interval_bounds(
     // Find the column in the plan_to_filter
     let find_column_result = find_timestamp_column_in_plan(&plan_to_filter, bound_column);
 
-    let (column_id, time_unit) = match find_column_result {
+    let (column_id, time_unit, time_zone) = match find_column_result {
         Some(result) => result,
         None => return plan_err!("Timestamp column '{}' not found in plan", bound_column.name),
     };
 
+    let scalar_time_zone = time_zone.clone();
+
     // Convert nanosecond bounds to appropriate time unit
+    println!("BBBB TIME_UNIT: {:?}", time_unit);
     let (lower_bound, upper_bound) = match time_unit {
         TimeUnit::Nanosecond => (
-            ScalarValue::TimestampNanosecond(Some(interval.start_ns), None),
-            ScalarValue::TimestampNanosecond(Some(interval.end_ns), None),
+            ScalarValue::TimestampNanosecond(Some(interval.start_ns), scalar_time_zone.clone()),
+            ScalarValue::TimestampNanosecond(Some(interval.end_ns), scalar_time_zone.clone()),
         ),
         TimeUnit::Microsecond => (
-            ScalarValue::TimestampMicrosecond(Some(interval.start_ns / 1000), None),
-            ScalarValue::TimestampMicrosecond(Some(interval.end_ns / 1000), None),
+            ScalarValue::TimestampMicrosecond(
+                Some(interval.start_ns / 1000),
+                scalar_time_zone.clone(),
+            ),
+            ScalarValue::TimestampMicrosecond(
+                Some(interval.end_ns / 1000),
+                scalar_time_zone.clone(),
+            ),
         ),
         TimeUnit::Millisecond => (
-            ScalarValue::TimestampMillisecond(Some(interval.start_ns / 1_000_000), None),
-            ScalarValue::TimestampMillisecond(Some(interval.end_ns / 1_000_000), None),
+            ScalarValue::TimestampMillisecond(
+                Some(interval.start_ns / 1_000_000),
+                scalar_time_zone.clone(),
+            ),
+            ScalarValue::TimestampMillisecond(
+                Some(interval.end_ns / 1_000_000),
+                scalar_time_zone.clone(),
+            ),
         ),
         TimeUnit::Second => (
-            ScalarValue::TimestampSecond(Some(interval.start_ns / 1_000_000_000), None),
-            ScalarValue::TimestampSecond(Some(interval.end_ns / 1_000_000_000), None),
+            ScalarValue::TimestampSecond(
+                Some(interval.start_ns / 1_000_000_000),
+                scalar_time_zone.clone(),
+            ),
+            ScalarValue::TimestampSecond(
+                Some(interval.end_ns / 1_000_000_000),
+                scalar_time_zone.clone(),
+            ),
         ),
     };
 
@@ -703,6 +726,8 @@ fn with_interval_bounds(
         FilterExec::try_new(interval_predicate, plan_to_filter)?
     };
 
+    println!("BBBB NEW_FILTER_EXEC: {:?}", new_filter_exec);
+
     // Now reconstruct the plan with the new filter
     if let Some(agg_exec) = partial_agg_exec.as_any().downcast_ref::<AggregateExec>() {
         let new_input: Arc<dyn ExecutionPlan> = if let Some(exprs) = projection_exprs {
@@ -728,7 +753,10 @@ fn with_interval_bounds(
 }
 
 /// Find timestamp column in the execution plan by traversing through projections and filters
-fn find_timestamp_column_in_plan(plan: &Arc<dyn ExecutionPlan>, column: &Column) -> Option<(usize, TimeUnit)> {
+fn find_timestamp_column_in_plan(
+    plan: &Arc<dyn ExecutionPlan>,
+    column: &Column,
+) -> Option<(usize, TimeUnit, Option<Arc<str>>)> {
     // Check current plan's schema
     if let Some(result) = find_column_in_schema(&plan.schema(), column) {
         return Some(result);
@@ -744,11 +772,14 @@ fn find_timestamp_column_in_plan(plan: &Arc<dyn ExecutionPlan>, column: &Column)
     None
 }
 
-fn find_column_in_schema(schema: &datafusion::arrow::datatypes::Schema, column: &Column) -> Option<(usize, TimeUnit)> {
+fn find_column_in_schema(
+    schema: &datafusion::arrow::datatypes::Schema,
+    column: &Column,
+) -> Option<(usize, TimeUnit, Option<Arc<str>>)> {
     schema.fields().iter().enumerate().find_map(|(id, f)| {
         if f.name() == &column.name {
-            if let DataType::Timestamp(time_unit, _) = f.data_type() {
-                Some((id, *time_unit))
+            if let DataType::Timestamp(time_unit, tz) = f.data_type() {
+                Some((id, *time_unit, tz.clone()))
             } else {
                 None
             }

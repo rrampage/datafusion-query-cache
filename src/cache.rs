@@ -115,6 +115,9 @@ pub fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
     let timestamp_re = regex::Regex::new(r"TimestampNanosecond\(\d+,\s*None\)").unwrap();
     result = timestamp_re.replace_all(&result, "TimestampNanosecond(?, None)").to_string();
 
+    let timestamp_re = regex::Regex::new(r"TimestampMicrosecond\(\d+,\s*None\)").unwrap();
+    result = timestamp_re.replace_all(&result, "TimestampMicrosecond(?, None)").to_string();
+
     // Replace string timestamp literals
     let string_timestamp_re = regex::Regex::new(r"Utf8\([^)]+\)").unwrap();
     result = string_timestamp_re.replace_all(&result, "Utf8(?)").to_string();
@@ -167,16 +170,10 @@ impl QueryCache for MemoryQueryCache {
         // let found_intervals: Option<Vec<(TimeInterval, Arc<Vec<RecordBatch>>)>> = None;
         let found_intervals = cache.get(&query_fingerprint_string);
         if let Some(intervals) = found_intervals {
-            println!("AAAA CACHE_DEBUG: Found intervals: {:?}", intervals);
+            println!("AAAA CACHE_DEBUG: Found intervals: {:?}", intervals.iter().map(|(interval, _)| interval.clone()).collect::<Vec<_>>());
         } else {
             println!("AAAA CACHE_DEBUG: No intervals found");
         }
-        // for (key, intervals) in cache.iter() {
-        //     if key == &query_fingerprint_string {
-        //         found_intervals = Some(intervals);
-        //         break;
-        //     }
-        // }
 
         if let Some(intervals) = found_intervals {
             // Find all intervals that overlap with the requested interval

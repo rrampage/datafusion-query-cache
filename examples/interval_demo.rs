@@ -68,7 +68,6 @@ async fn run_interval_demo() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = session_ctx(cache.clone()).await;
     let table = MemTable::try_new(data_batch.schema(), vec![vec![data_batch.clone()]]).unwrap();
     ctx.register_table("events", Arc::new(table)).unwrap();
-
     run_queries(&ctx, &cache, examples).await?;
 
     Ok(())
