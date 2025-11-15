@@ -15,7 +15,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 
 use aggregate::{QCAggregateExecPlanner, QCAggregateOptimizerRule};
 pub use aggregate::{normalize_temporal_bounds_in_expr, normalize_temporal_bounds_in_plan, CachedAggregateExec, CacheUpdateAggregateExec};
-pub use cache::{print_cache_state, MemoryQueryCache, OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
+pub use cache::{normalize_fingerprint_for_caching, print_cache_state, MemoryQueryCache, OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
 pub use log::{LogNoOp, LogStderrColors};
 
 #[derive(Debug)]

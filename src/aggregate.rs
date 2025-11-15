@@ -7,15 +7,15 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{internal_err, plan_err, Column, DFSchemaRef, Result as DataFusionResult, ScalarValue};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
-    Aggregate, Between, BinaryExpr, Cast, Expr, Extension, Filter, LogicalPlan, Operator, TableScan, UserDefinedLogicalNode,
+    Aggregate, Between, BinaryExpr, Expr, Extension, Filter, LogicalPlan, Operator, TableScan, UserDefinedLogicalNode,
     UserDefinedLogicalNodeCore,
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
@@ -34,7 +34,7 @@ use datafusion::physical_plan::{collect, DisplayAs, DisplayFormatType, Execution
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::TryFutureExt;
 
-use crate::cache::{OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
+use crate::cache::{normalize_fingerprint_for_caching, OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
 use crate::log::{log_info, log_warn, AbstractLog};
 use crate::QueryCacheConfig;
 
@@ -145,12 +145,14 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         let param_fingerprint = if !temporal_columns_for_param.is_empty() {
             let normalized_plan = normalize_temporal_bounds_in_plan(&plan, &temporal_columns_for_param);
             let param_fingerprint_str = normalized_plan.display_indent_schema().to_string();
+            println!("BBBB PRENORMALIZED: Param fingerprint: '{}'", param_fingerprint_str);
             // Normalize the fingerprint by removing schema-specific information from TableScan
             normalize_fingerprint_for_caching(&param_fingerprint_str)
         } else {
             // Even without temporal columns, normalize for consistency
             normalize_fingerprint_for_caching(&fingerprint)
         };
+        println!("BBBB NORMALIZED: Param fingerprint: '{}'", param_fingerprint);
 
         if temporal_group_by.is_none() {
             // if temporal_group_by is none, we need to make sure the sort column is in the projection
@@ -314,8 +316,8 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
     fn expressions(&self) -> Vec<Expr> {
         let mut expressions = vec![Expr::Column(self.temporal_column.clone())];
         if let Some(interval) = &self.interval {
-            expressions.push(Expr::Literal(ScalarValue::Int64(Some(interval.start_ns))));
-            expressions.push(Expr::Literal(ScalarValue::Int64(Some(interval.end_ns))));
+            expressions.push(Expr::Literal(ScalarValue::Int64(Some(interval.start_ns)), None));
+            expressions.push(Expr::Literal(ScalarValue::Int64(Some(interval.end_ns)), None));
         }
         expressions
     }
@@ -329,7 +331,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
         let Some(Expr::Column(column)) = iter_exprs.next() else {
             return plan_err!("UserDefinedLogicalNodeCore  expected temporal column as first expressoin");
         };
-        let interval = if let (Some(Expr::Literal(ScalarValue::Int64(Some(start_ns)))), Some(Expr::Literal(ScalarValue::Int64(Some(end_ns))))) = (iter_exprs.next(), iter_exprs.next()) {
+        let interval = if let (Some(Expr::Literal(ScalarValue::Int64(Some(start_ns)), _)), Some(Expr::Literal(ScalarValue::Int64(Some(end_ns)), _))) = (iter_exprs.next(), iter_exprs.next()) {
             if iter_exprs.next().is_some() {
                 return plan_err!("UserDefinedLogicalNodeCore expected one, two, or three expressions");
             }
@@ -625,25 +627,26 @@ fn with_interval_bounds(
     // For gap computation, we need to apply the interval bounds to the data source.
     // If partial_agg_exec is an AggregateExec, we apply the filter to its input.
     // If the input is a ProjectionExec with empty projection, we apply the filter to its input.
-    let (plan_to_filter, column_offset) = if let Some(agg_exec) = partial_agg_exec.as_any().downcast_ref::<AggregateExec>() {
-        // Find where to apply the filter
-        let input = agg_exec.input();
-        if let Some(proj_exec) = input.as_any().downcast_ref::<ProjectionExec>() {
-            // If the input is a projection with empty projection, apply filter to its input
-            if proj_exec.expr().is_empty() {
-                (proj_exec.input().clone(), 0)
+    let (plan_to_filter, column_offset, projection_exprs) =
+        if let Some(agg_exec) = partial_agg_exec.as_any().downcast_ref::<AggregateExec>() {
+            // Find where to apply the filter
+            let input = agg_exec.input();
+            if let Some(proj_exec) = input.as_any().downcast_ref::<ProjectionExec>() {
+                // If the input is a projection with empty projection, apply filter to its input
+                if proj_exec.expr().is_empty() {
+                    (proj_exec.input().clone(), 0, None)
+                } else {
+                    // Projection has expressions; apply filter before the projection
+                    (proj_exec.input().clone(), 0, Some(proj_exec.expr().to_vec()))
+                }
             } else {
-                // Projection has expressions, apply filter to the projection
-                (input.clone(), 0)
+                // Apply filter to the aggregate input
+                (input.clone(), 0, None)
             }
         } else {
-            // Apply filter to the aggregate input
-            (input.clone(), 0)
-        }
-    } else {
-        // Not an AggregateExec, apply filter directly
-        (partial_agg_exec.clone(), 0)
-    };
+            // Not an AggregateExec, apply filter directly
+            (partial_agg_exec.clone(), 0, None)
+        };
 
     // Find the column in the plan_to_filter
     let find_column_result = find_timestamp_column_in_plan(&plan_to_filter, bound_column);
@@ -702,17 +705,11 @@ fn with_interval_bounds(
 
     // Now reconstruct the plan with the new filter
     if let Some(agg_exec) = partial_agg_exec.as_any().downcast_ref::<AggregateExec>() {
-        let input = agg_exec.input();
-        let new_input: Arc<dyn ExecutionPlan> = if let Some(proj_exec) = input.as_any().downcast_ref::<ProjectionExec>() {
-            if proj_exec.expr().is_empty() {
-                // Replace the projection's input with the new filter
-                Arc::new(ProjectionExec::try_new(proj_exec.expr().to_vec(), Arc::new(new_filter_exec))?)
-            } else {
-                // The projection has expressions, so apply filter to it
-                Arc::new(ProjectionExec::try_new(proj_exec.expr().to_vec(), Arc::new(new_filter_exec))?)
-            }
+        let new_input: Arc<dyn ExecutionPlan> = if let Some(exprs) = projection_exprs {
+            // Projection existed, so reapply its expressions on top of the filtered plan
+            Arc::new(ProjectionExec::try_new(exprs, Arc::new(new_filter_exec))?)
         } else {
-            // The aggregate input is not a projection, replace it with the new filter
+            // No projection to reapply, use the filtered plan directly
             Arc::new(new_filter_exec)
         };
 
@@ -834,6 +831,7 @@ impl DisplayAs for CacheUpdateAggregateExec {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
             DisplayFormatType::Verbose => write!(f, "{} {{ interval: {:?}, input: {} }}", self.name(), self.interval(), self.input.name()),
+            DisplayFormatType::TreeRender => todo!(),
         }
     }
 }
@@ -947,6 +945,7 @@ impl DisplayAs for CachedAggregateExec {
         match t {
             DisplayFormatType::Default => write!(f, "{}", self.name()),
             DisplayFormatType::Verbose => write!(f, "{} {{ interval: {:?} }}", self.name(), self.interval()),
+            DisplayFormatType::TreeRender => todo!(),
         }
     }
 }
@@ -1023,8 +1022,8 @@ pub fn normalize_temporal_bounds_in_expr(expr: &Expr, temporal_columns: &HashSet
 
             if is_temporal_comparison {
                 // Replace the literal with a placeholder
-                let placeholder = Expr::Literal(ScalarValue::Utf8(Some("?".to_string())));
-                let normalized_right = if matches!(right.as_ref(), Expr::Literal(_)) {
+                let placeholder = Expr::Literal(ScalarValue::Utf8(Some("?".to_string())), None);
+                let normalized_right = if matches!(right.as_ref(), Expr::Literal(..)) {
                     placeholder
                 } else {
                     normalize_temporal_bounds_in_expr(right, temporal_columns)
@@ -1055,13 +1054,13 @@ pub fn normalize_temporal_bounds_in_expr(expr: &Expr, temporal_columns: &HashSet
 
             if is_temporal_between {
                 // Replace literals with placeholders
-                let placeholder = Expr::Literal(ScalarValue::Utf8(Some("?".to_string())));
-                let normalized_low = if matches!(low.as_ref(), Expr::Literal(_)) {
+                let placeholder = Expr::Literal(ScalarValue::Utf8(Some("?".to_string())), None);
+                let normalized_low = if matches!(low.as_ref(), Expr::Literal(..)) {
                     placeholder.clone()
                 } else {
                     normalize_temporal_bounds_in_expr(low, temporal_columns)
                 };
-                let normalized_high = if matches!(high.as_ref(), Expr::Literal(_)) {
+                let normalized_high = if matches!(high.as_ref(), Expr::Literal(..)) {
                     placeholder
                 } else {
                     normalize_temporal_bounds_in_expr(high, temporal_columns)
@@ -1129,24 +1128,6 @@ pub fn normalize_temporal_bounds_in_plan(plan: &LogicalPlan, temporal_columns: &
     }
 }
 
-/// Normalize a fingerprint string for consistent caching by removing schema-specific details
-fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
-    let mut result = fingerprint.to_string();
-
-    // Replace timestamp literals with placeholders
-    let timestamp_re = regex::Regex::new(r"TimestampMicrosecond\(\d+,\s*None\)").unwrap();
-    result = timestamp_re.replace_all(&result, "TimestampMicrosecond(?, None)").to_string();
-
-    // Replace string timestamp literals
-    let string_timestamp_re = regex::Regex::new(r"Utf8\([^)]+\)").unwrap();
-    result = string_timestamp_re.replace_all(&result, "Utf8(?)").to_string();
-
-    // Replace TableScan schema information with a canonical representation
-    let table_scan_re = regex::Regex::new(r"TableScan: \w+ \[[^\]]+\]").unwrap();
-    result = table_scan_re.replace_all(&result, "TableScan: $table [normalized_schema]").to_string();
-
-    result
-}
 
 /// Extract static time intervals from expressions (e.g., BETWEEN, >=, <=)
 #[derive(Debug)]
@@ -1164,7 +1145,7 @@ impl StaticInterval {
         match expr {
             Expr::BinaryExpr(bin_expr) => Self::find_bin_expr(bin_expr, columns),
             Expr::Between(between) => Self::find_between(between, columns),
-            Expr::Literal(_) | Expr::Column(_) => Self::Stable,
+            Expr::Literal(..) | Expr::Column(_) => Self::Stable,
             Expr::Not(e) | Expr::Negative(e) => match Self::find(e, columns) {
                 Self::Stable => Self::Stable,
                 _ => Self::Abandon,
@@ -1255,13 +1236,13 @@ impl StaticInterval {
 
     fn extract_timestamp_ns(expr: &Expr) -> Option<i64> {
         match expr {
-            Expr::Literal(ScalarValue::TimestampNanosecond(Some(ns), _)) => Some(*ns),
-            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us * 1_000),
-            Expr::Literal(ScalarValue::TimestampMillisecond(Some(ms), _)) => Some(ms * 1_000_000),
-            Expr::Literal(ScalarValue::TimestampSecond(Some(s), _)) => Some(s * 1_000_000_000),
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(ns), _), _) => Some(*ns),
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(us), _), _) => Some(us * 1_000),
+            Expr::Literal(ScalarValue::TimestampMillisecond(Some(ms), _), _) => Some(ms * 1_000_000),
+            Expr::Literal(ScalarValue::TimestampSecond(Some(s), _), _) => Some(s * 1_000_000_000),
             // Handle cast expressions: CAST(string_literal AS TIMESTAMP)
             Expr::Cast(cast) => {
-                if let Expr::Literal(ScalarValue::Utf8(Some(timestamp_str))) = cast.expr.as_ref() {
+                if let Expr::Literal(ScalarValue::Utf8(Some(timestamp_str)), _) = cast.expr.as_ref() {
                     // Try to parse as RFC3339 timestamp
                     if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str) {
                         dt.timestamp_nanos_opt().map(|ns| ns)

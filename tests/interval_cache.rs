@@ -229,13 +229,13 @@ async fn test_param_fingerprint_normalization_simple_bounds() {
     let expr1 = Expr::BinaryExpr(BinaryExpr {
         left: Box::new(Expr::Column(Column::new(Some("test".to_string()), "timestamp".to_string()))),
         op: Operator::GtEq,
-        right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067200000000), None))),
+        right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067200000000), None), None)),
     });
 
     let expr2 = Expr::BinaryExpr(BinaryExpr {
         left: Box::new(Expr::Column(Column::new(Some("test".to_string()), "timestamp".to_string()))),
         op: Operator::GtEq,
-        right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067800000000), None))),
+        right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067800000000), None), None)),
     });
 
     let normalized1 = normalize_temporal_bounds_in_expr(&expr1, &temporal_columns);
@@ -247,7 +247,7 @@ async fn test_param_fingerprint_normalization_simple_bounds() {
     // Verify the structure is preserved
     if let Expr::BinaryExpr(bin) = normalized1 {
         assert_eq!(bin.op, Operator::GtEq);
-        if let Expr::Literal(lit) = bin.right.as_ref() {
+        if let Expr::Literal(lit, _) = bin.right.as_ref() {
             assert_eq!(lit, &datafusion::common::ScalarValue::Utf8(Some("?".to_string())));
         } else {
             panic!("Expected literal in normalized expression");
@@ -267,8 +267,8 @@ async fn test_param_fingerprint_between_normalization() {
     let between_expr = Expr::Between(Between {
         expr: Box::new(Expr::Column(Column::new(Some("test".to_string()), "timestamp".to_string()))),
         negated: false,
-        low: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067200000000), None))),
-        high: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704070800000000), None))),
+        low: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067200000000), None), None)),
+        high: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704070800000000), None), None)),
     });
 
     // Equivalent >= AND <= expression
@@ -276,13 +276,13 @@ async fn test_param_fingerprint_between_normalization() {
         left: Box::new(Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new(Some("test".to_string()), "timestamp".to_string()))),
             op: Operator::GtEq,
-            right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067200000000), None))),
+            right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704067200000000), None), None)),
         })),
         op: Operator::And,
         right: Box::new(Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new(Some("test".to_string()), "timestamp".to_string()))),
             op: Operator::LtEq,
-            right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704070800000000), None))),
+            right: Box::new(Expr::Literal(datafusion::common::ScalarValue::TimestampMicrosecond(Some(1704070800000000), None), None)),
         })),
     });
 
@@ -294,10 +294,10 @@ async fn test_param_fingerprint_between_normalization() {
 
     // Check BETWEEN normalization
     if let Expr::Between(between) = normalized_between {
-        if let Expr::Literal(low_lit) = between.low.as_ref() {
+        if let Expr::Literal(low_lit, _) = between.low.as_ref() {
             assert_eq!(low_lit, &datafusion::common::ScalarValue::Utf8(Some("?".to_string())));
         }
-        if let Expr::Literal(high_lit) = between.high.as_ref() {
+        if let Expr::Literal(high_lit, _) = between.high.as_ref() {
             assert_eq!(high_lit, &datafusion::common::ScalarValue::Utf8(Some("?".to_string())));
         }
     } else {
@@ -307,12 +307,12 @@ async fn test_param_fingerprint_between_normalization() {
     // Check range normalization
     if let Expr::BinaryExpr(and_expr) = normalized_range {
         if let Expr::BinaryExpr(left_expr) = and_expr.left.as_ref() {
-            if let Expr::Literal(lit) = left_expr.right.as_ref() {
+            if let Expr::Literal(lit, _) = left_expr.right.as_ref() {
                 assert_eq!(lit, &datafusion::common::ScalarValue::Utf8(Some("?".to_string())));
             }
         }
         if let Expr::BinaryExpr(right_expr) = and_expr.right.as_ref() {
-            if let Expr::Literal(lit) = right_expr.right.as_ref() {
+            if let Expr::Literal(lit, _) = right_expr.right.as_ref() {
                 assert_eq!(lit, &datafusion::common::ScalarValue::Utf8(Some("?".to_string())));
             }
         }

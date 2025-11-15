@@ -12,16 +12,8 @@ use datafusion_query_cache::{with_query_cache_log, LogStderrColors, MemoryQueryC
 use std::sync::Arc;
 use std::collections::HashMap;
 
-async fn print_cache_contents(cache: &MemoryQueryCache) {
-    println!("\n=== CACHE CONTENTS ===");
-    let cache_display = cache.display();
-    if cache_display.trim().is_empty() || cache_display.contains("MemoryQueryCache:") && !cache_display.contains("timestamp:") {
-        println!("Cache is empty");
-    } else {
-        println!("{}", cache_display);
-    }
-    println!("=====================\n");
-}
+mod common;
+use common::{print_cache_contents};
 
 struct QueryExample {
     name: &'static str,

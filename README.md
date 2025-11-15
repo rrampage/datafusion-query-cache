@@ -4,6 +4,8 @@
 
 See [apache/datafusion#12779](https://github.com/apache/datafusion/issues/12779) for discussion.
 
+**Compatibility**: This crate currently supports DataFusion 50.3.0 and Tokio 1.48.0.
+
 Cache the intermediate results of queries on timeseries data in DataFusion.
 
 ## How it works (the very quick version)

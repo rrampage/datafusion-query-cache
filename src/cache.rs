@@ -107,6 +107,25 @@ impl fmt::Debug for MemoryQueryCache {
     }
 }
 
+/// Normalize a fingerprint string for consistent caching by removing schema-specific details
+pub fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
+    let mut result = fingerprint.to_string();
+
+    // Replace timestamp literals with placeholders
+    let timestamp_re = regex::Regex::new(r"TimestampNanosecond\(\d+,\s*None\)").unwrap();
+    result = timestamp_re.replace_all(&result, "TimestampNanosecond(?, None)").to_string();
+
+    // Replace string timestamp literals
+    let string_timestamp_re = regex::Regex::new(r"Utf8\([^)]+\)").unwrap();
+    result = string_timestamp_re.replace_all(&result, "Utf8(?)").to_string();
+
+    // Replace TableScan schema information with a canonical representation
+    let table_scan_re = regex::Regex::new(r"TableScan: \w+ \[[^\]]+\]").unwrap();
+    result = table_scan_re.replace_all(&result, "TableScan: $table [normalized_schema]").to_string();
+
+    result
+}
+
 impl MemoryQueryCache {
     pub fn display(&self) -> String {
         struct DisplayMemoryQueryCache<'a>(&'a MemoryQueryCache);
@@ -139,17 +158,25 @@ impl MemoryQueryCache {
 #[async_trait]
 impl QueryCache for MemoryQueryCache {
     async fn lookup(&self, query_fingerprint: &str, req: &TimeInterval) -> DataFusionResult<Vec<Arc<dyn OccupiedIntervalCacheEntry>>> {
+        println!("AAAA CACHE_DEBUG: Looking up fingerprint: '{}'", query_fingerprint);
+        println!("AAAA CACHE_DEBUG: Requested interval: [{}, {})", req.start_ns, req.end_ns);
         let cache = self.cache.lock().unwrap();
         let query_fingerprint_string = query_fingerprint.to_string();
 
         // Find the matching intervals
-        let mut found_intervals = None;
-        for (key, intervals) in cache.iter() {
-            if key == &query_fingerprint_string {
-                found_intervals = Some(intervals);
-                break;
-            }
+        // let found_intervals: Option<Vec<(TimeInterval, Arc<Vec<RecordBatch>>)>> = None;
+        let found_intervals = cache.get(&query_fingerprint_string);
+        if let Some(intervals) = found_intervals {
+            println!("AAAA CACHE_DEBUG: Found intervals: {:?}", intervals);
+        } else {
+            println!("AAAA CACHE_DEBUG: No intervals found");
         }
+        // for (key, intervals) in cache.iter() {
+        //     if key == &query_fingerprint_string {
+        //         found_intervals = Some(intervals);
+        //         break;
+        //     }
+        // }
 
         if let Some(intervals) = found_intervals {
             // Find all intervals that overlap with the requested interval
