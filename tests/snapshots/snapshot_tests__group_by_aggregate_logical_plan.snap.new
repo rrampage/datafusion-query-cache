@@ -1,0 +1,9 @@
+---
+source: tests/snapshot_tests.rs
+assertion_line: 72
+expression: logical_plan_str
+---
+Projection: date_trunc(Utf8("hour"),test_table.timestamp), count(Int64(1)) AS count(*) [date_trunc(Utf8("hour"),test_table.timestamp):Timestamp(Microsecond, None);N, count(*):Int64]
+  Aggregate: groupBy=[[date_trunc(Utf8("hour"), test_table.timestamp)]], aggr=[[count(Int64(1))]] [date_trunc(Utf8("hour"),test_table.timestamp):Timestamp(Microsecond, None);N, count(Int64(1)):Int64]
+    Filter: test_table.timestamp >= Utf8("2024-01-01T00:00:00Z") AND test_table.timestamp < Utf8("2024-01-02T00:00:00Z") [timestamp:Timestamp(Microsecond, None), service:Utf8;N, value:Int64;N]
+      TableScan: test_table [timestamp:Timestamp(Microsecond, None), service:Utf8;N, value:Int64;N]

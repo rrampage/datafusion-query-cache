@@ -164,3 +164,61 @@ async fn session_ctx() -> SessionContext {
 ```
 
 See [`examples/demo.rs`](./examples/demo.rs) for a more complete working example.
+
+## Snapshot Testing
+
+This project uses [insta](https://insta.rs/) for snapshot testing to ensure plan stability and catch regressions in query optimization behavior. Snapshot tests capture the current state of logical and physical plans, execution metrics, and other plan-related outputs, allowing you to verify that changes to the optimizer don't break expected behavior.
+
+### Running Snapshot Tests
+
+To run the snapshot tests:
+
+```bash
+cargo test --test snapshot_tests
+```
+
+When you first run snapshot tests, or when the output changes, insta will create `.snap.new` files in the `tests/snapshots/` directory. You can review and accept these changes using:
+
+```bash
+# Review all snapshot changes
+cargo insta review
+
+# Accept all snapshot changes
+cargo insta accept
+```
+
+### How Snapshot Testing Works
+
+The snapshot tests cover:
+
+- **Logical Plan Snapshots**: Capture the optimized logical plans to ensure optimizer rules are applied correctly
+- **Physical Plan Snapshots**: Capture the physical execution plans to verify cache nodes are inserted properly
+- **Cache Interval Information**: Track cached vs gap intervals in physical plans
+- **Execution Metrics**: Monitor bytes scanned and performance metrics
+- **Plan Comparisons**: Compare vanilla vs cached contexts to verify optimization behavior
+
+### Writing New Snapshot Tests
+
+To add new snapshot tests, use the `insta::assert_snapshot!` macro:
+
+```rust
+#[tokio::test]
+async fn test_my_new_feature() {
+    // ... setup code ...
+
+    // Capture logical plan
+    let logical_plan_str = format_logical_plan(logical_plan);
+    insta::assert_snapshot!("my_feature_logical_plan", logical_plan_str);
+
+    // Capture physical plan
+    let physical_plan_str = format_physical_plan(&physical_plan);
+    insta::assert_snapshot!("my_feature_physical_plan", physical_plan_str);
+}
+```
+
+### Best Practices
+
+- **Review Changes Carefully**: Always review snapshot changes to ensure they represent intentional behavior changes
+- **Update Snapshots Intentionally**: Only accept snapshot changes when you're confident the behavior change is correct
+- **Descriptive Names**: Use descriptive snapshot names that clearly indicate what they're testing
+- **Stable Test Data**: Use consistent test data to ensure reproducible snapshots
