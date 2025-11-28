@@ -37,12 +37,23 @@ impl TimeInterval {
 
 #[async_trait]
 pub trait QueryCache: Send + Sync + fmt::Debug {
-    async fn lookup(&self, query_fingerprint: &str, req: &TimeInterval) -> DataFusionResult<Vec<Arc<dyn OccupiedIntervalCacheEntry>>>;
-    async fn put(&self, query_fingerprint: &str, interval: TimeInterval, record_batch: &[RecordBatch]) -> DataFusionResult<()>;
+    async fn lookup(
+        &self,
+        query_fingerprint: &str,
+        req: &TimeInterval,
+    ) -> DataFusionResult<Vec<Arc<dyn OccupiedIntervalCacheEntry>>>;
+    async fn put(
+        &self,
+        query_fingerprint: &str,
+        interval: TimeInterval,
+        record_batch: &[RecordBatch],
+    ) -> DataFusionResult<()>;
 }
 
 pub async fn print_cache_state<C: QueryCache>(cache: &C, fingerprint: &str) -> DataFusionResult<()> {
-    let intervals = cache.lookup(fingerprint, &TimeInterval::new(i64::MIN, i64::MAX)).await?;
+    let intervals = cache
+        .lookup(fingerprint, &TimeInterval::new(i64::MIN, i64::MAX))
+        .await?;
     if intervals.is_empty() {
         println!("Cache[{}] = <empty>", fingerprint);
     } else {
@@ -50,7 +61,13 @@ pub async fn print_cache_state<C: QueryCache>(cache: &C, fingerprint: &str) -> D
         for (i, entry) in intervals.iter().enumerate() {
             let interval = entry.interval();
             let batches = entry.get().await?;
-            println!("  interval[{}]: [{}, {}) batches={}", i, interval.start_ns, interval.end_ns, batches.len());
+            println!(
+                "  interval[{}]: [{}, {}) batches={}",
+                i,
+                interval.start_ns,
+                interval.end_ns,
+                batches.len()
+            );
             for (j, batch) in batches.iter().enumerate() {
                 println!("    batch[{}]: {:?}", j, batch);
             }
@@ -112,18 +129,12 @@ pub fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
     let mut result = fingerprint.to_string();
 
     // Replace timestamp literals with placeholders, keeping timezone normalization
-    let timestamp_ns_re = regex::Regex::new(
-        r#"TimestampNanosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#,
-    )
-    .unwrap();
+    let timestamp_ns_re = regex::Regex::new(r#"TimestampNanosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#).unwrap();
     result = timestamp_ns_re
         .replace_all(&result, "TimestampNanosecond(?, None)")
         .to_string();
 
-    let timestamp_us_re = regex::Regex::new(
-        r#"TimestampMicrosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#,
-    )
-    .unwrap();
+    let timestamp_us_re = regex::Regex::new(r#"TimestampMicrosecond\(\d+,\s*(?:None|Some\("[^"]*"\))\)"#).unwrap();
     result = timestamp_us_re
         .replace_all(&result, "TimestampMicrosecond(?, None)")
         .to_string();
@@ -134,7 +145,9 @@ pub fn normalize_fingerprint_for_caching(fingerprint: &str) -> String {
 
     // Replace TableScan schema information with a canonical representation
     let table_scan_re = regex::Regex::new(r"TableScan: \w+ \[[^\]]+\]").unwrap();
-    result = table_scan_re.replace_all(&result, "TableScan: $table [normalized_schema]").to_string();
+    result = table_scan_re
+        .replace_all(&result, "TableScan: $table [normalized_schema]")
+        .to_string();
 
     result
 }
@@ -149,8 +162,11 @@ impl MemoryQueryCache {
                 for (fingerprint, intervals) in self.0.cache.lock().unwrap().iter() {
                     for (interval, record_batch) in intervals {
                         let table = pretty_format_batches(record_batch).map_err(|_| fmt::Error)?;
-                        writeln!(f, "Fingerprint (cache key): {fingerprint}\ninterval: [{}, {}) data:\n{table}",
-                                interval.start_ns, interval.end_ns)?;
+                        writeln!(
+                            f,
+                            "Fingerprint (cache key): {fingerprint}\ninterval: [{}, {}) data:\n{table}",
+                            interval.start_ns, interval.end_ns
+                        )?;
                     }
                 }
                 Ok(())
@@ -170,9 +186,16 @@ impl MemoryQueryCache {
 
 #[async_trait]
 impl QueryCache for MemoryQueryCache {
-    async fn lookup(&self, query_fingerprint: &str, req: &TimeInterval) -> DataFusionResult<Vec<Arc<dyn OccupiedIntervalCacheEntry>>> {
+    async fn lookup(
+        &self,
+        query_fingerprint: &str,
+        req: &TimeInterval,
+    ) -> DataFusionResult<Vec<Arc<dyn OccupiedIntervalCacheEntry>>> {
         println!("AAAA CACHE_DEBUG: Looking up fingerprint: '{}'", query_fingerprint);
-        println!("AAAA CACHE_DEBUG: Requested interval: [{}, {})", req.start_ns, req.end_ns);
+        println!(
+            "AAAA CACHE_DEBUG: Requested interval: [{}, {})",
+            req.start_ns, req.end_ns
+        );
         let cache = self.cache.lock().unwrap();
         let query_fingerprint_string = query_fingerprint.to_string();
 
@@ -180,7 +203,13 @@ impl QueryCache for MemoryQueryCache {
         // let found_intervals: Option<Vec<(TimeInterval, Arc<Vec<RecordBatch>>)>> = None;
         let found_intervals = cache.get(&query_fingerprint_string);
         if let Some(intervals) = found_intervals {
-            println!("AAAA CACHE_DEBUG: Found intervals: {:?}", intervals.iter().map(|(interval, _)| interval.clone()).collect::<Vec<_>>());
+            println!(
+                "AAAA CACHE_DEBUG: Found intervals: {:?}",
+                intervals
+                    .iter()
+                    .map(|(interval, _)| interval.clone())
+                    .collect::<Vec<_>>()
+            );
         } else {
             println!("AAAA CACHE_DEBUG: No intervals found");
         }
@@ -203,7 +232,12 @@ impl QueryCache for MemoryQueryCache {
         }
     }
 
-    async fn put(&self, query_fingerprint: &str, interval: TimeInterval, record_batch: &[RecordBatch]) -> DataFusionResult<()> {
+    async fn put(
+        &self,
+        query_fingerprint: &str,
+        interval: TimeInterval,
+        record_batch: &[RecordBatch],
+    ) -> DataFusionResult<()> {
         self.put(query_fingerprint, interval, record_batch);
         Ok(())
     }

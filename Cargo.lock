@@ -1244,6 +1244,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "datafusion-common",
  "futures",
  "insta",
  "regex",

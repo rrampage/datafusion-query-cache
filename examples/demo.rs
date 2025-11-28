@@ -1,19 +1,21 @@
 use chrono::{DateTime, FixedOffset};
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray};
+use datafusion::arrow::array::{
+    Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::util::pretty::print_batches;
 use datafusion::common::Column;
 use datafusion::datasource::MemTable;
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_query_cache::{with_query_cache_log, LogStderrColors, MemoryQueryCache, QueryCacheConfig};
-use std::sync::Arc;
+use datafusion_query_cache::{LogStderrColors, MemoryQueryCache, QueryCacheConfig, with_query_cache_log};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 mod common;
-use common::{print_cache_contents};
+use common::print_cache_contents;
 
 struct QueryExample {
     name: &'static str,
@@ -96,7 +98,8 @@ async fn run_query_comparison() -> Result<(), Box<dyn std::error::Error>> {
         let table = MemTable::try_new(batch1.schema(), vec![vec![batch1.clone()]]).unwrap();
         ctx_cached.register_table("records", Arc::new(table)).unwrap();
 
-        let cached_plan = execute_query_and_get_plan(&ctx_cached, &cache, example.sql, "First Run (with caching)").await?;
+        let cached_plan =
+            execute_query_and_get_plan(&ctx_cached, &cache, example.sql, "First Run (with caching)").await?;
         print_cache_contents(&cache).await;
 
         // Add more data and run again
@@ -104,7 +107,8 @@ async fn run_query_comparison() -> Result<(), Box<dyn std::error::Error>> {
         let table = MemTable::try_new(batch1.schema(), partitions.clone()).unwrap();
         ctx_cached2.register_table("records", Arc::new(table)).unwrap();
 
-        let cached_plan2 = execute_query_and_get_plan(&ctx_cached2, &cache, example.sql, "Second Run (cache hit expected)").await?;
+        let cached_plan2 =
+            execute_query_and_get_plan(&ctx_cached2, &cache, example.sql, "Second Run (cache hit expected)").await?;
         print_cache_contents(&cache).await;
 
         // Run without caching
@@ -282,11 +286,7 @@ fn create_data(start: DateTime<FixedOffset>, stop: DateTime<FixedOffset>) -> Rec
 
 fn create_data_old() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("service", DataType::Utf8, true),
         Field::new("value", DataType::Int64, true),
     ]));

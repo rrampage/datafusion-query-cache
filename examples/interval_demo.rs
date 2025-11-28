@@ -1,10 +1,10 @@
-use chrono::{DateTime};
+use chrono::DateTime;
 use datafusion::datasource::MemTable;
+use datafusion_query_cache::MemoryQueryCache;
 use std::sync::Arc;
-use datafusion_query_cache::{MemoryQueryCache};
 
 mod common;
-use common::{create_time_series_data, IntervalDemoQuery, session_ctx, run_queries};
+use common::{IntervalDemoQuery, create_time_series_data, run_queries, session_ctx};
 
 async fn run_interval_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔥 INTERVAL-BASED QUERY CACHING DEMO 🔥");
@@ -17,7 +17,10 @@ async fn run_interval_demo() -> Result<(), Box<dyn std::error::Error>> {
     let end_time = DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z").unwrap();
 
     let data_batch = create_time_series_data(start_time, end_time);
-    println!("📊 Created time-series dataset: {} records spanning 24 hours", data_batch.num_rows());
+    println!(
+        "📊 Created time-series dataset: {} records spanning 24 hours",
+        data_batch.num_rows()
+    );
 
     let examples = vec![
         /*IntervalDemoQuery::new(

@@ -1,19 +1,18 @@
 use chrono::{DateTime, FixedOffset};
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampNanosecondArray};
-use datafusion_query_cache::MemoryQueryCache;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use std::sync::Arc;
-use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::common::Column;
-use datafusion_query_cache::with_query_cache_log;
-use datafusion_query_cache::LogStderrColors;
-use datafusion_query_cache::QueryCacheConfig;
 use datafusion::arrow::util::pretty::print_batches;
+use datafusion::common::Column;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::displayable;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_query_cache::LogStderrColors;
+use datafusion_query_cache::MemoryQueryCache;
+use datafusion_query_cache::QueryCacheConfig;
+use datafusion_query_cache::with_query_cache_log;
 use std::collections::HashMap;
-
+use std::sync::Arc;
 
 pub struct IntervalDemoQuery {
     name: &'static str,
@@ -26,7 +25,12 @@ pub const SERVICES: [&str; 5] = ["api-gateway", "database", "cache", "external-a
 
 impl IntervalDemoQuery {
     pub fn new(name: &'static str, sql: &'static str, description: &'static str, explanation: &'static str) -> Self {
-        Self { name, sql, description, explanation }
+        Self {
+            name,
+            sql,
+            description,
+            explanation,
+        }
     }
 
     pub fn name(&self) -> &'static str {
@@ -49,7 +53,9 @@ impl IntervalDemoQuery {
 pub async fn print_cache_contents(cache: &MemoryQueryCache) {
     println!("\n=== CACHE CONTENTS ===");
     let cache_display = cache.display();
-    if cache_display.trim().is_empty() || cache_display.contains("MemoryQueryCache:") && !cache_display.contains("timestamp:") {
+    if cache_display.trim().is_empty()
+        || cache_display.contains("MemoryQueryCache:") && !cache_display.contains("timestamp:")
+    {
         println!("Cache is empty");
     } else {
         println!("{}", cache_display);
@@ -96,7 +102,11 @@ pub fn create_time_series_data(start: DateTime<FixedOffset>, stop: DateTime<Fixe
             _ => 150,
         };
 
-        let load_factor = if hour_of_day >= 9 && hour_of_day <= 17 { 1.5 } else { 1.0 };
+        let load_factor = if hour_of_day >= 9 && hour_of_day <= 17 {
+            1.5
+        } else {
+            1.0
+        };
         let response_time = (base_response as f64 * load_factor * (0.5 + (seed as f64 * 0.1).sin().abs())) as i64;
         response_times.push(response_time.max(10));
 
@@ -133,15 +143,18 @@ pub async fn session_ctx(cache: Arc<MemoryQueryCache>) -> SessionContext {
         .with_default_features();
 
     let sort_col = Column::new(Some("events".to_string()), "timestamp".to_string());
-    let query_cache_config = QueryCacheConfig::new(sort_col, cache)
-        .with_group_by_function("date_trunc");
+    let query_cache_config = QueryCacheConfig::new(sort_col, cache).with_group_by_function("date_trunc");
 
     let log = LogStderrColors::default();
     let state_builder = with_query_cache_log(state_builder, query_cache_config, log);
     SessionContext::new_with_state(state_builder.build())
 }
 
-pub async fn run_queries(ctx: &SessionContext, cache: &MemoryQueryCache, queries: Vec<IntervalDemoQuery>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_queries(
+    ctx: &SessionContext,
+    cache: &MemoryQueryCache,
+    queries: Vec<IntervalDemoQuery>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut execution_times = HashMap::new();
 
     for (i, example) in queries.iter().enumerate() {
@@ -201,4 +214,3 @@ pub async fn run_queries(ctx: &SessionContext, cache: &MemoryQueryCache, queries
 
 #[tokio::main]
 async fn main() {}
-

@@ -28,7 +28,10 @@ async fn test_single_interval_lookup() {
 
     // Put an interval [10, 20) into cache
     let interval = TimeInterval::new(10, 20);
-    cache.put(fingerprint, interval.clone(), &[batch.clone()]).await.unwrap();
+    cache
+        .put(fingerprint, interval.clone(), &[batch.clone()])
+        .await
+        .unwrap();
 
     // Lookup the exact same interval - should find it
     let entries = cache.lookup(fingerprint, &interval).await.unwrap();
@@ -88,8 +91,14 @@ async fn test_overlapping_intervals_partial() {
     // Put two overlapping intervals: [10, 30) and [20, 40)
     let interval1 = TimeInterval::new(10, 30);
     let interval2 = TimeInterval::new(20, 40);
-    cache.put(fingerprint, interval1.clone(), &[batch.clone()]).await.unwrap();
-    cache.put(fingerprint, interval2.clone(), &[batch.clone()]).await.unwrap();
+    cache
+        .put(fingerprint, interval1.clone(), &[batch.clone()])
+        .await
+        .unwrap();
+    cache
+        .put(fingerprint, interval2.clone(), &[batch.clone()])
+        .await
+        .unwrap();
 
     // Lookup interval [15, 35) that overlaps with both cached intervals
     let lookup_interval = TimeInterval::new(15, 35);
@@ -173,7 +182,10 @@ async fn test_empty_cache_lookup() {
     let cache = MemoryQueryCache::default();
 
     // Lookup on empty cache should return empty
-    let entries = cache.lookup("any_fingerprint", &TimeInterval::new(10, 20)).await.unwrap();
+    let entries = cache
+        .lookup("any_fingerprint", &TimeInterval::new(10, 20))
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 0);
 }
 
@@ -186,7 +198,10 @@ async fn test_multiple_batches_per_interval() {
 
     // Put multiple batches for the same interval
     let interval = TimeInterval::new(10, 20);
-    cache.put(fingerprint, interval.clone(), &[batch1.clone(), batch2.clone()]).await.unwrap();
+    cache
+        .put(fingerprint, interval.clone(), &[batch1.clone(), batch2.clone()])
+        .await
+        .unwrap();
 
     // Lookup should return the interval with both batches
     let entries = cache.lookup(fingerprint, &interval).await.unwrap();
