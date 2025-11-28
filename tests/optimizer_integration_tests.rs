@@ -21,6 +21,10 @@ fn register_test_table(ctx: &SessionContext) {
     ctx.register_table("test_table", Arc::new(table)).unwrap();
 }
 
+fn build_vanilla_context() -> SessionContext {
+    test_utils::TestContextBuilder::new().build_vanilla()
+}
+
 /// Test simple aggregate query optimization
 #[tokio::test]
 async fn test_simple_aggregate_query() {
@@ -242,6 +246,110 @@ async fn test_partial_cache_overlap() {
 
     let results2 = df2.collect().await.unwrap();
     assert!(!results2.is_empty(), "Should return results for larger interval");
+}
+
+#[tokio::test]
+async fn test_cached_vs_vanilla_alias_results_match() {
+    let cached_ctx = build_cached_context();
+    register_test_table(&cached_ctx);
+
+    let vanilla_ctx = build_vanilla_context();
+    register_test_table(&vanilla_ctx);
+
+    let query = "SELECT count(*) FROM test_table AS t WHERE t.timestamp >= '2024-01-01T00:00:00Z' AND t.timestamp < '2024-01-02T00:00:00Z'";
+
+    let cached_results = test_utils::execute_query(&cached_ctx, query).await.unwrap();
+    let vanilla_results = test_utils::execute_query(&vanilla_ctx, query).await.unwrap();
+
+    assert_eq!(
+        cached_results, vanilla_results,
+        "Cached and vanilla contexts must return identical results for aliased queries"
+    );
+}
+
+#[tokio::test]
+async fn test_partial_cache_overlap_with_alias() {
+    let ctx = build_cached_context();
+    register_test_table(&ctx);
+
+    let query1 = "SELECT count(*) FROM test_table AS t WHERE t.timestamp >= '2024-01-01T00:00:00Z' AND t.timestamp < '2024-01-01T12:00:00Z'";
+    let _ = test_utils::execute_query(&ctx, query1).await.unwrap();
+
+    let query2 = "SELECT count(*) FROM test_table AS t WHERE t.timestamp >= '2024-01-01T00:00:00Z' AND t.timestamp < '2024-01-02T00:00:00Z'";
+    let df = ctx.sql(query2).await.unwrap();
+    let physical_plan = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
+
+    let cache_info = test_utils::collect_exec_intervals(&physical_plan);
+    assert!(
+        !cache_info.cached_intervals.is_empty(),
+        "Aliased partial overlap should use cached intervals"
+    );
+    assert!(
+        !cache_info.gap_intervals.is_empty(),
+        "Aliased partial overlap should compute gaps for uncovered ranges"
+    );
+
+    let results = df.collect().await.unwrap();
+    assert!(!results.is_empty(), "Aliased partial overlap should return results");
+}
+
+#[tokio::test]
+async fn test_non_temporal_filter_aggregate_no_cache() {
+    let cached_ctx = build_cached_context();
+    register_test_table(&cached_ctx);
+
+    let vanilla_ctx = build_vanilla_context();
+    register_test_table(&vanilla_ctx);
+
+    let query = "SELECT count(*) FROM test_table WHERE service = 'service_a'";
+
+    let (_cached_logical, cached_physical) = test_utils::get_plans_as_strings(&cached_ctx, query).await.unwrap();
+    let (_vanilla_logical, vanilla_physical) = test_utils::get_plans_as_strings(&vanilla_ctx, query).await.unwrap();
+
+    assert!(
+        !cached_physical.contains("CacheUpdateAggregateExec"),
+        "Optimizer should not inject cache nodes for non-temporal filters: {}",
+        cached_physical
+    );
+    assert_eq!(
+        cached_physical, vanilla_physical,
+        "Cached and vanilla physical plans should match when caching is not applicable"
+    );
+
+    let cached_results = test_utils::execute_query(&cached_ctx, query).await.unwrap();
+    let vanilla_results = test_utils::execute_query(&vanilla_ctx, query).await.unwrap();
+    assert_eq!(cached_results, vanilla_results, "Results should match for non-temporal filter");
+}
+
+#[tokio::test]
+async fn test_non_temporal_filter_alias_no_cache() {
+    let cached_ctx = build_cached_context();
+    register_test_table(&cached_ctx);
+
+    let vanilla_ctx = build_vanilla_context();
+    register_test_table(&vanilla_ctx);
+
+    let query = "SELECT count(*) FROM test_table AS t WHERE t.service = 'service_a'";
+
+    let (_cached_logical, cached_physical) = test_utils::get_plans_as_strings(&cached_ctx, query).await.unwrap();
+    let (_vanilla_logical, vanilla_physical) = test_utils::get_plans_as_strings(&vanilla_ctx, query).await.unwrap();
+
+    assert!(
+        !cached_physical.contains("CacheUpdateAggregateExec"),
+        "Optimizer should not inject cache nodes for aliased queries with non-temporal filters: {}",
+        cached_physical
+    );
+    assert_eq!(
+        cached_physical, vanilla_physical,
+        "Cached and vanilla plans should be identical for aliased non-temporal filters"
+    );
+
+    let cached_results = test_utils::execute_query(&cached_ctx, query).await.unwrap();
+    let vanilla_results = test_utils::execute_query(&vanilla_ctx, query).await.unwrap();
+    assert_eq!(
+        cached_results, vanilla_results,
+        "Aliased queries with non-temporal filters must return the same result"
+    );
 }
 
 /// Test bytes scanned reduction with caching
