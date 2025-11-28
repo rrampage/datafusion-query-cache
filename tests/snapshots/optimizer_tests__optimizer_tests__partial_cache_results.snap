@@ -1,0 +1,9 @@
+---
+source: tests/optimizer_tests.rs
+expression: vanilla_results_str
+---
++----------+
+| count(*) |
++----------+
+| 288      |
++----------+

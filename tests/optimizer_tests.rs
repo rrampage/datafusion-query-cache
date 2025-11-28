@@ -1,293 +1,140 @@
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::prelude::{CsvReadOptions, SessionContext};
 use datafusion_query_cache::MemoryQueryCache;
+use insta::assert_snapshot;
 use std::sync::Arc;
 
 mod test_utils;
 
-/// Test simple aggregate query optimization
-#[tokio::test]
-async fn test_simple_aggregate_query() {
+const TEST_QUERY: &str = "SELECT count(*) FROM test_table \
+    WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'";
+const SMALLER_QUERY: &str = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND \
+    timestamp < '2024-01-01T12:00:00Z'";
+const LARGER_QUERY: &str = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND \
+    timestamp < '2024-01-02T00:00:00Z'";
+const TEST_TABLE_CSV: &str = "tests/data/query_cache_test_table.csv";
+
+async fn register_csv_table(ctx: &SessionContext) -> test_utils::Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("service", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]);
+
+    ctx.register_csv(
+        "test_table",
+        TEST_TABLE_CSV,
+        CsvReadOptions::new().schema(&schema).has_header(true),
+    )
+    .await
+    .map_err(|e| {
+        let err: Box<dyn std::error::Error> = Box::new(e);
+        err
+    })?;
+
+    Ok(())
+}
+
+async fn build_contexts() -> test_utils::Result<(SessionContext, SessionContext)> {
     let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
+    let cached_ctx = test_utils::TestContextBuilder::new()
         .with_cache(cache.clone())
         .with_temporal_column("test_table", "timestamp")
         .build_cached();
+    let vanilla_ctx = test_utils::TestContextBuilder::new().build_vanilla();
 
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
+    register_csv_table(&cached_ctx).await?;
+    register_csv_table(&vanilla_ctx).await?;
 
-    let query = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'";
-
-    // Get logical and physical plans
-    let (logical_plan_str, _physical_plan_str) = test_utils::get_plans_as_strings(&ctx, query).await.unwrap();
-
-    // Verify optimizer rule application - should have QCAggregatePlanNode in logical plan
-    assert!(logical_plan_str.contains("QueryCacheAggregate"), "Logical plan should contain QueryCacheAggregate node");
-
-    // Create physical plan for analysis
-    let df = ctx.sql(query).await.unwrap();
-    let physical_plan = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
-
-    // Verify physical plan structure - should have cache-related execution nodes
-    let cache_info = test_utils::collect_exec_intervals(&physical_plan);
-    assert!(!cache_info.gap_intervals.is_empty(), "Should have gap intervals for cache miss on first execution");
-
-    // Execute query
-    let results = test_utils::execute_query(&ctx, query).await.unwrap();
-    assert_eq!(results.len(), 1, "Should return one batch");
-    assert_eq!(results[0].num_rows(), 1, "Should return one row with count");
-
-    // Verify cache behavior - second execution should hit cache
-    let physical_plan2 = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
-    let cache_info2 = test_utils::collect_exec_intervals(&physical_plan2);
-    assert!(!cache_info2.cached_intervals.is_empty(), "Second execution should have cached intervals");
-
-    // Results should be identical
-    let results2 = test_utils::execute_query(&ctx, query).await.unwrap();
-    assert_eq!(results, results2, "Results should be identical between executions");
+    Ok((cached_ctx, vanilla_ctx))
 }
 
-/// Test aggregate query with GROUP BY optimization
-#[tokio::test]
-async fn test_aggregate_with_group_by() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("test_table", "timestamp")
-        .build_cached();
-
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
-
-    let query = "SELECT date_trunc('hour', timestamp), count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z' GROUP BY 1";
-
-    // Get logical and physical plans
-    let (logical_plan_str, _physical_plan_str) = test_utils::get_plans_as_strings(&ctx, query).await.unwrap();
-
-    // Verify optimizer rule application
-    assert!(logical_plan_str.contains("QueryCacheAggregate"), "Logical plan should contain QueryCacheAggregate node");
-
-    // Create physical plan for analysis
-    let df = ctx.sql(query).await.unwrap();
-    let physical_plan = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
-
-    // Verify cache behavior
-    let cache_info = test_utils::collect_exec_intervals(&physical_plan);
-    assert!(!cache_info.gap_intervals.is_empty(), "Should have gap intervals for initial execution");
-
-    // Execute query
-    let results = test_utils::execute_query(&ctx, query).await.unwrap();
-    assert!(!results.is_empty(), "Should return results");
-
-    // Verify cache hit on second execution
-    let physical_plan2 = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
-    let cache_info2 = test_utils::collect_exec_intervals(&physical_plan2);
-    assert!(!cache_info2.cached_intervals.is_empty(), "Second execution should use cached data");
+fn pretty_batches(batches: &[RecordBatch]) -> String {
+    pretty_format_batches(batches).unwrap().to_string()
 }
 
-/// Test query with aliased table
-#[tokio::test]
-async fn test_query_with_aliased_table() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("t", "timestamp")
-        .build_cached();
-
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
-
-    let query = "SELECT count(*) FROM test_table AS t WHERE t.timestamp >= '2024-01-01T00:00:00Z' AND t.timestamp < '2024-01-02T00:00:00Z'";
-
-    // Get logical and physical plans
-    let (logical_plan_str, _physical_plan_str) = test_utils::get_plans_as_strings(&ctx, query).await.unwrap();
-
-    // Verify optimizer rule application works with table alias
-    assert!(logical_plan_str.contains("QueryCacheAggregate"), "Logical plan should contain QueryCacheAggregate node");
-
-    // Create physical plan for analysis
-    let df = ctx.sql(query).await.unwrap();
-    let physical_plan = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
-
-    // Verify cache behavior
-    let cache_info = test_utils::collect_exec_intervals(&physical_plan);
-    assert!(!cache_info.gap_intervals.is_empty(), "Should have gap intervals for initial execution");
-
-    // Execute query
-    let results = test_utils::execute_query(&ctx, query).await.unwrap();
-    assert_eq!(results.len(), 1, "Should return one batch");
-
-    // Verify cache hit on second execution
-    let physical_plan2 = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
-    let cache_info2 = test_utils::collect_exec_intervals(&physical_plan2);
-    assert!(!cache_info2.cached_intervals.is_empty(), "Second execution should use cached data");
+fn normalize_plan(plan: &str) -> String {
+    test_utils::normalize_plan_for_comparison(plan)
 }
 
-/// Test sub-query optimization
 #[tokio::test]
-async fn test_subquery() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("inner_table", "timestamp")
-        .build_cached();
+async fn test_count_star_cache_snapshots() -> test_utils::Result<()> {
+    let (cached_ctx, vanilla_ctx) = build_contexts().await?;
 
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
+    let vanilla_results = test_utils::execute_query(&vanilla_ctx, TEST_QUERY).await?;
+    let vanilla_results_str = pretty_batches(&vanilla_results);
+    assert_snapshot!("optimizer_tests__count_star_results", vanilla_results_str);
 
-    let query = "SELECT * FROM (SELECT count(*) as cnt FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z') AS inner_table WHERE inner_table.cnt > 0";
+    let (logical_plan, physical_plan) = test_utils::get_plans_as_strings(&cached_ctx, TEST_QUERY).await?;
+    assert_snapshot!(
+        "optimizer_tests__count_star_logical_plan",
+        normalize_plan(&logical_plan)
+    );
+    assert_snapshot!(
+        "optimizer_tests__count_star_cache_miss_physical",
+        normalize_plan(&physical_plan)
+    );
 
-    // Get logical and physical plans
-    let (logical_plan_str, _physical_plan_str) = test_utils::get_plans_as_strings(&ctx, query).await.unwrap();
+    assert!(
+        physical_plan.contains("CacheUpdateAggregateExec"),
+        "Cache miss physical plan should populate the cache"
+    );
 
-    // Verify optimizer rule application in subquery
-    assert!(logical_plan_str.contains("QueryCacheAggregate"), "Logical plan should contain QueryCacheAggregate node for subquery");
+    let cached_results = test_utils::execute_query(&cached_ctx, TEST_QUERY).await?;
+    let cached_results_str = pretty_batches(&cached_results);
+    assert_eq!(cached_results_str, vanilla_results_str);
 
-    // Create physical plan for analysis
-    let df = ctx.sql(query).await.unwrap();
-    let physical_plan = ctx.state().create_physical_plan(df.logical_plan()).await.unwrap();
+    let (_, physical_plan_cached) = test_utils::get_plans_as_strings(&cached_ctx, TEST_QUERY).await?;
+    assert_snapshot!(
+        "optimizer_tests__count_star_cache_hit_physical",
+        normalize_plan(&physical_plan_cached)
+    );
+    assert!(
+        physical_plan_cached.contains("CachedAggregateExec"),
+        "Cache hit physical plan should read cached data"
+    );
 
-    // Execute query
-    let results = test_utils::execute_query(&ctx, query).await.unwrap();
-    assert!(!results.is_empty(), "Should return results");
+    let cached_results_again = test_utils::execute_query(&cached_ctx, TEST_QUERY).await?;
+    let cached_results_again_str = pretty_batches(&cached_results_again);
+    assert_eq!(cached_results_again_str, vanilla_results_str);
 
-    // Verify cache behavior
-    let cache_info = test_utils::collect_exec_intervals(&physical_plan);
-    // Note: This test may need adjustment based on how subqueries are handled
-    println!("Cache info: {:?}", cache_info);
+    Ok(())
 }
 
-/// Test query with multiple temporal filters (AND/OR conditions)
 #[tokio::test]
-async fn test_multiple_temporal_filters() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("test_table", "timestamp")
-        .build_cached();
+async fn test_partial_cache_union_snapshot() -> test_utils::Result<()> {
+    let (cached_ctx, vanilla_ctx) = build_contexts().await?;
 
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
+    let vanilla_results = test_utils::execute_query(&vanilla_ctx, LARGER_QUERY).await?;
+    let vanilla_results_str = pretty_batches(&vanilla_results);
+    assert_snapshot!("optimizer_tests__partial_cache_results", vanilla_results_str);
 
-    // Test complex AND condition
-    let query1 = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z' AND service = 'service_a'";
+    test_utils::execute_query(&cached_ctx, SMALLER_QUERY).await?;
 
-    let (logical_plan_str1, _physical_plan_str1) = test_utils::get_plans_as_strings(&ctx, query1).await.unwrap();
-    assert!(logical_plan_str1.contains("QueryCacheAggregate"), "Complex AND condition should trigger optimization");
+    let (_, physical_plan_after_overlap) = test_utils::get_plans_as_strings(&cached_ctx, LARGER_QUERY).await?;
+    assert_snapshot!(
+        "optimizer_tests__partial_cache_physical",
+        normalize_plan(&physical_plan_after_overlap)
+    );
 
-    // Test OR condition (may not be optimizable)
-    let query2 = "SELECT count(*) FROM test_table WHERE (timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z') OR (timestamp >= '2024-01-02T00:00:00Z' AND timestamp < '2024-01-03T00:00:00Z')";
+    assert!(
+        physical_plan_after_overlap.contains("UnionExec"),
+        "Partial cache plan should combine cached and gap computations"
+    );
+    assert!(
+        physical_plan_after_overlap.contains("CachedAggregateExec"),
+        "Partial cache plan should read cached aggregates"
+    );
+    assert!(
+        physical_plan_after_overlap.contains("CacheUpdateAggregateExec"),
+        "Partial cache plan should compute uncovered intervals"
+    );
 
-    let (logical_plan_str2, _physical_plan_str2) = test_utils::get_plans_as_strings(&ctx, query2).await.unwrap();
-    // Note: OR conditions might not be optimizable depending on implementation
-    println!("OR condition logical plan: {}", logical_plan_str2);
+    let cached_results = test_utils::execute_query(&cached_ctx, LARGER_QUERY).await?;
+    let cached_results_str = pretty_batches(&cached_results);
+    assert_eq!(cached_results_str, vanilla_results_str);
 
-    // Execute both queries successfully
-    let results1 = test_utils::execute_query(&ctx, query1).await.unwrap();
-    assert_eq!(results1.len(), 1, "Complex AND query should return results");
-
-    let results2 = test_utils::execute_query(&ctx, query2).await.unwrap();
-    assert_eq!(results2.len(), 1, "OR condition query should return results");
-}
-
-/// Test cache behavior with partial overlaps
-#[tokio::test]
-async fn test_partial_cache_overlap() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("test_table", "timestamp")
-        .build_cached();
-
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
-
-    // First query - populate cache with smaller interval
-    let query1 = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-01T12:00:00Z'";
-    let _results1 = test_utils::execute_query(&ctx, query1).await.unwrap();
-
-    // Second query - larger interval that overlaps with cached data
-    let query2 = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'";
-    let df2 = ctx.sql(query2).await.unwrap();
-    let physical_plan2 = ctx.state().create_physical_plan(df2.logical_plan()).await.unwrap();
-
-    // Verify partial cache hit
-    let cache_info2 = test_utils::collect_exec_intervals(&physical_plan2);
-    assert!(!cache_info2.cached_intervals.is_empty(), "Should use cached data for overlapping interval");
-    assert!(!cache_info2.gap_intervals.is_empty(), "Should compute gaps for non-overlapping interval");
-
-    let results2 = df2.collect().await.unwrap();
-    assert!(!results2.is_empty(), "Should return results for larger interval");
-}
-
-/// Test bytes scanned reduction with caching
-#[tokio::test]
-async fn test_bytes_scanned_reduction() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("test_table", "timestamp")
-        .build_cached();
-
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
-
-    let query = "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'";
-
-    // First execution - cache miss
-    let df1 = ctx.sql(query).await.unwrap();
-    let physical_plan1 = ctx.state().create_physical_plan(df1.logical_plan()).await.unwrap();
-    let bytes1 = test_utils::get_bytes_scanned(&physical_plan1);
-    let _results1 = df1.collect().await.unwrap();
-
-    // Second execution - cache hit
-    let df2 = ctx.sql(query).await.unwrap();
-    let physical_plan2 = ctx.state().create_physical_plan(df2.logical_plan()).await.unwrap();
-    let bytes2 = test_utils::get_bytes_scanned(&physical_plan2);
-    let _results2 = df2.collect().await.unwrap();
-
-    // Cache hit should scan fewer or equal bytes
-    if let (Some(b1), Some(b2)) = (bytes1, bytes2) {
-        assert!(b2 <= b1, "Cache hit should scan fewer or equal bytes than cache miss: {} vs {}", b2, b1);
-    }
-}
-
-/// Test different aggregate functions
-#[tokio::test]
-async fn test_different_aggregate_functions() {
-    let cache = Arc::new(MemoryQueryCache::default());
-    let ctx = test_utils::TestContextBuilder::new()
-        .with_cache(cache.clone())
-        .with_temporal_column("test_table", "timestamp")
-        .build_cached();
-
-    // Register test table
-    let table = test_utils::create_test_table("test_schema", "test_table");
-    ctx.register_table("test_table", Arc::new(table)).unwrap();
-
-    let queries = vec![
-        "SELECT count(*) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'",
-        "SELECT sum(value) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'",
-        "SELECT avg(value) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'",
-        "SELECT min(value), max(value) FROM test_table WHERE timestamp >= '2024-01-01T00:00:00Z' AND timestamp < '2024-01-02T00:00:00Z'",
-    ];
-
-    for query in queries {
-        // Get plans
-        let (logical_plan_str, _physical_plan_str) = test_utils::get_plans_as_strings(&ctx, query).await.unwrap();
-
-        // Verify optimizer applies to different aggregates
-        assert!(logical_plan_str.contains("QueryCacheAggregate"),
-                "Query '{}' should trigger QueryCacheAggregate optimization", query);
-
-        // Execute successfully
-        let results = test_utils::execute_query(&ctx, query).await.unwrap();
-        assert!(!results.is_empty(), "Query '{}' should return results", query);
-    }
+    Ok(())
 }

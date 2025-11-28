@@ -11,7 +11,7 @@ use chrono::DateTime;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::Transformed;
-use datafusion::common::{internal_err, plan_err, Column, DFSchemaRef, Result as DataFusionResult, ScalarValue};
+use datafusion::common::{Column, DFSchemaRef, Result as DataFusionResult, ScalarValue, internal_err, plan_err};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
@@ -23,21 +23,21 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion::physical_expr::expressions::{
     BinaryExpr as PhysicalBinaryExpr, Column as PhysicalColumn, Literal as PhysicalLiteral,
 };
+use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{collect, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, collect};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use datafusion::physical_plan::Partitioning;
 use futures::TryFutureExt;
 
-use crate::cache::{normalize_fingerprint_for_caching, OccupiedIntervalCacheEntry, QueryCache, TimeInterval};
-use crate::log::{log_info, log_warn, AbstractLog};
 use crate::QueryCacheConfig;
+use crate::cache::{OccupiedIntervalCacheEntry, QueryCache, TimeInterval, normalize_fingerprint_for_caching};
+use crate::log::{AbstractLog, log_info, log_warn};
 
 #[derive(Debug)]
 pub(crate) struct QCAggregateOptimizerRule<Log: AbstractLog> {
@@ -85,7 +85,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         _config: &dyn OptimizerConfig,
     ) -> DataFusionResult<Transformed<LogicalPlan>> {
         let mut fingerprint = plan.display_indent_schema().to_string();
-        
+
         // Log the input plan for this optimizer rule
         log_info!(
             self.log,
@@ -94,7 +94,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             self.name(),
             plan.display_indent_schema()
         );
-        
+
         let LogicalPlan::Aggregate(agg) = &plan else {
             // not an aggregation, continue rewrite
             log_info!(
@@ -172,8 +172,10 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
 
             let Some(scan) = scan else {
                 // TODO we need to support this, e.g. a subquery
-                self.log
-                    .info(&fingerprint, "input not a table scan (through filters/projections), caching not possible")?;
+                self.log.info(
+                    &fingerprint,
+                    "input not a table scan (through filters/projections), caching not possible",
+                )?;
                 return Ok(Transformed::no(plan));
             };
 
@@ -236,7 +238,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             "query valid for caching, sort column {}",
             temporal_column
         );
-        
+
         let transformed_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
@@ -245,14 +247,14 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                 Some(param_fingerprint.clone()),
             )?),
         });
-        
+
         log_info!(
             self.log,
             &param_fingerprint,
             "Plan transformed with QueryCacheAggregate extension node:\n{}",
             transformed_plan.display_indent_schema()
         );
-        
+
         Ok(Transformed::yes(transformed_plan))
     }
 }
@@ -334,7 +336,11 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
         let Some(Expr::Column(column)) = iter_exprs.next() else {
             return plan_err!("UserDefinedLogicalNodeCore  expected temporal column as first expressoin");
         };
-        let interval = if let (Some(Expr::Literal(ScalarValue::Int64(Some(start_ns)), _)), Some(Expr::Literal(ScalarValue::Int64(Some(end_ns)), _))) = (iter_exprs.next(), iter_exprs.next()) {
+        let interval = if let (
+            Some(Expr::Literal(ScalarValue::Int64(Some(start_ns)), _)),
+            Some(Expr::Literal(ScalarValue::Int64(Some(end_ns)), _)),
+        ) = (iter_exprs.next(), iter_exprs.next())
+        {
             if iter_exprs.next().is_some() {
                 return plan_err!("UserDefinedLogicalNodeCore expected one, two, or three expressions");
             }
@@ -436,7 +442,11 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
         };
 
         println!("CACHE_DEBUG: Looking up fingerprint: '{}'", &agg_node.fingerprint);
-        let cached_intervals = self.config.cache().lookup(&agg_node.fingerprint, &requested_interval).await?;
+        let cached_intervals = self
+            .config
+            .cache()
+            .lookup(&agg_node.fingerprint, &requested_interval)
+            .await?;
         log_info!(
             self.log,
             &agg_node.fingerprint,
@@ -566,9 +576,11 @@ fn select_maximal_cached_intervals(
 
     for (interval, entry) in intervals_with_entries {
         // Check if this interval overlaps with any already selected
-        let overlaps_selected = selected.iter().any(|(_selected_interval, selected_entry): &(TimeInterval, Arc<dyn OccupiedIntervalCacheEntry>)| {
-            selected_entry.interval().overlaps(&interval)
-        });
+        let overlaps_selected = selected.iter().any(
+            |(_selected_interval, selected_entry): &(TimeInterval, Arc<dyn OccupiedIntervalCacheEntry>)| {
+                selected_entry.interval().overlaps(&interval)
+            },
+        );
 
         if !overlaps_selected {
             selected.push((interval, entry));
@@ -591,10 +603,7 @@ fn compute_gaps(
     }
 
     // Get all cached intervals sorted by start time
-    let mut cached_intervals: Vec<TimeInterval> = selected_cached
-        .iter()
-        .map(|entry| entry.interval())
-        .collect();
+    let mut cached_intervals: Vec<TimeInterval> = selected_cached.iter().map(|entry| entry.interval()).collect();
     cached_intervals.sort_by_key(|i| i.start_ns);
 
     let mut gaps = Vec::new();
@@ -615,7 +624,10 @@ fn compute_gaps(
 
     // Gap after last cached interval
     if cached_intervals.last().unwrap().end_ns < requested.end_ns {
-        gaps.push(TimeInterval::new(cached_intervals.last().unwrap().end_ns, requested.end_ns));
+        gaps.push(TimeInterval::new(
+            cached_intervals.last().unwrap().end_ns,
+            requested.end_ns,
+        ));
     }
 
     gaps
@@ -669,34 +681,16 @@ fn with_interval_bounds(
             ScalarValue::TimestampNanosecond(Some(interval.end_ns), scalar_time_zone.clone()),
         ),
         TimeUnit::Microsecond => (
-            ScalarValue::TimestampMicrosecond(
-                Some(interval.start_ns / 1000),
-                scalar_time_zone.clone(),
-            ),
-            ScalarValue::TimestampMicrosecond(
-                Some(interval.end_ns / 1000),
-                scalar_time_zone.clone(),
-            ),
+            ScalarValue::TimestampMicrosecond(Some(interval.start_ns / 1000), scalar_time_zone.clone()),
+            ScalarValue::TimestampMicrosecond(Some(interval.end_ns / 1000), scalar_time_zone.clone()),
         ),
         TimeUnit::Millisecond => (
-            ScalarValue::TimestampMillisecond(
-                Some(interval.start_ns / 1_000_000),
-                scalar_time_zone.clone(),
-            ),
-            ScalarValue::TimestampMillisecond(
-                Some(interval.end_ns / 1_000_000),
-                scalar_time_zone.clone(),
-            ),
+            ScalarValue::TimestampMillisecond(Some(interval.start_ns / 1_000_000), scalar_time_zone.clone()),
+            ScalarValue::TimestampMillisecond(Some(interval.end_ns / 1_000_000), scalar_time_zone.clone()),
         ),
         TimeUnit::Second => (
-            ScalarValue::TimestampSecond(
-                Some(interval.start_ns / 1_000_000_000),
-                scalar_time_zone.clone(),
-            ),
-            ScalarValue::TimestampSecond(
-                Some(interval.end_ns / 1_000_000_000),
-                scalar_time_zone.clone(),
-            ),
+            ScalarValue::TimestampSecond(Some(interval.start_ns / 1_000_000_000), scalar_time_zone.clone()),
+            ScalarValue::TimestampSecond(Some(interval.end_ns / 1_000_000_000), scalar_time_zone.clone()),
         ),
     };
 
@@ -790,7 +784,6 @@ fn find_column_in_schema(
     })
 }
 
-
 /// check for an existing `QCInnerAggregateExec` in the plan
 fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
     match plan.name() {
@@ -830,7 +823,7 @@ impl CacheUpdateAggregateExec {
         fingerprint: &str,
         interval: &TimeInterval,
         input: Arc<dyn ExecutionPlan>,
-        now: i64
+        now: i64,
     ) -> Arc<dyn ExecutionPlan> {
         // we need one partition so we can store one result in the cache, use `CoalescePartitionsExec`
         // if input is not already one
@@ -862,7 +855,13 @@ impl DisplayAs for CacheUpdateAggregateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
-            DisplayFormatType::Verbose => write!(f, "{} {{ interval: {:?}, input: {} }}", self.name(), self.interval(), self.input.name()),
+            DisplayFormatType::Verbose => write!(
+                f,
+                "{} {{ interval: {:?}, input: {} }}",
+                self.name(),
+                self.interval(),
+                self.input.name()
+            ),
             DisplayFormatType::TreeRender => todo!(),
         }
     }
@@ -915,10 +914,10 @@ impl ExecutionPlan for CacheUpdateAggregateExec {
                 self.input.clone(),
                 self.now,
                 context,
-                metrics
+                metrics,
             )
-                .map_ok(|partitions| futures::stream::iter(partitions.into_iter().map(Ok)))
-                .try_flatten_stream(),
+            .map_ok(|partitions| futures::stream::iter(partitions.into_iter().map(Ok)))
+            .try_flatten_stream(),
         )))
     }
 
@@ -958,7 +957,9 @@ impl CachedAggregateExec {
         cache_entry: Arc<dyn OccupiedIntervalCacheEntry>,
         inner_properties: &PlanProperties,
     ) -> Arc<dyn ExecutionPlan> {
-        let plan_props = inner_properties.clone().with_partitioning(Partitioning::UnknownPartitioning(1));
+        let plan_props = inner_properties
+            .clone()
+            .with_partitioning(Partitioning::UnknownPartitioning(1));
         Arc::new(Self {
             cache_entry,
             schema: inner_properties.eq_properties.schema().clone(),
@@ -1076,7 +1077,12 @@ pub fn normalize_temporal_bounds_in_expr(expr: &Expr, temporal_columns: &HashSet
             }
         }
         Expr::Between(between) => {
-            let Between { expr, negated, low, high } = between;
+            let Between {
+                expr,
+                negated,
+                low,
+                high,
+            } = between;
 
             // Check if this is a temporal BETWEEN
             let is_temporal_between = if let Expr::Column(col) = expr.as_ref() {
@@ -1119,7 +1125,9 @@ pub fn normalize_temporal_bounds_in_expr(expr: &Expr, temporal_columns: &HashSet
         Expr::Not(e) => Expr::Not(Box::new(normalize_temporal_bounds_in_expr(e, temporal_columns))),
         Expr::Negative(e) => Expr::Negative(Box::new(normalize_temporal_bounds_in_expr(e, temporal_columns))),
         Expr::ScalarFunction(func) => {
-            let args = func.args.iter()
+            let args = func
+                .args
+                .iter()
                 .map(|arg| normalize_temporal_bounds_in_expr(arg, temporal_columns))
                 .collect();
             Expr::ScalarFunction(ScalarFunction {
@@ -1138,29 +1146,41 @@ pub fn normalize_temporal_bounds_in_plan(plan: &LogicalPlan, temporal_columns: &
     match plan {
         LogicalPlan::Filter(filter) => {
             let normalized_predicate = normalize_temporal_bounds_in_expr(&filter.predicate, temporal_columns);
-            LogicalPlan::Filter(Filter::try_new(
-                normalized_predicate,
-                Arc::new(normalize_temporal_bounds_in_plan(filter.input.as_ref(), temporal_columns)),
-            ).expect("Failed to create normalized filter"))
+            LogicalPlan::Filter(
+                Filter::try_new(
+                    normalized_predicate,
+                    Arc::new(normalize_temporal_bounds_in_plan(
+                        filter.input.as_ref(),
+                        temporal_columns,
+                    )),
+                )
+                .expect("Failed to create normalized filter"),
+            )
         }
         LogicalPlan::Aggregate(agg) => {
-            let normalized_group_expr = agg.group_expr.iter()
+            let normalized_group_expr = agg
+                .group_expr
+                .iter()
                 .map(|expr| normalize_temporal_bounds_in_expr(expr, temporal_columns))
                 .collect();
-            let normalized_aggr_expr = agg.aggr_expr.iter()
+            let normalized_aggr_expr = agg
+                .aggr_expr
+                .iter()
                 .map(|expr| normalize_temporal_bounds_in_expr(expr, temporal_columns))
                 .collect();
-            LogicalPlan::Aggregate(Aggregate::try_new(
-                Arc::new(normalize_temporal_bounds_in_plan(agg.input.as_ref(), temporal_columns)),
-                normalized_group_expr,
-                normalized_aggr_expr,
-            ).expect("Failed to create normalized aggregate"))
+            LogicalPlan::Aggregate(
+                Aggregate::try_new(
+                    Arc::new(normalize_temporal_bounds_in_plan(agg.input.as_ref(), temporal_columns)),
+                    normalized_group_expr,
+                    normalized_aggr_expr,
+                )
+                .expect("Failed to create normalized aggregate"),
+            )
         }
         // For other plan types, return as-is (we only normalize expressions in aggregations with filters)
         _ => plan.clone(),
     }
 }
-
 
 /// Extract static time intervals from expressions (e.g., BETWEEN, >=, <=)
 #[derive(Debug)]
@@ -1273,15 +1293,20 @@ impl StaticInterval {
             Expr::Literal(ScalarValue::TimestampMicrosecond(Some(us), _), _) => Some(us * 1_000),
             Expr::Literal(ScalarValue::TimestampMillisecond(Some(ms), _), _) => Some(ms * 1_000_000),
             Expr::Literal(ScalarValue::TimestampSecond(Some(s), _), _) => Some(s * 1_000_000_000),
+            // Handle raw Utf8 literals (e.g., timestamp >= '2024-01-01T00:00:00Z')
+            Expr::Literal(ScalarValue::Utf8(Some(timestamp_str)), _) => {
+                // Try to parse as RFC3339 timestamp
+                DateTime::parse_from_rfc3339(timestamp_str)
+                    .ok()
+                    .and_then(|dt| dt.timestamp_nanos_opt())
+            }
             // Handle cast expressions: CAST(string_literal AS TIMESTAMP)
             Expr::Cast(cast) => {
                 if let Expr::Literal(ScalarValue::Utf8(Some(timestamp_str)), _) = cast.expr.as_ref() {
                     // Try to parse as RFC3339 timestamp
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str) {
-                        dt.timestamp_nanos_opt().map(|ns| ns)
-                    } else {
-                        None
-                    }
+                    DateTime::parse_from_rfc3339(timestamp_str)
+                        .ok()
+                        .and_then(|dt| dt.timestamp_nanos_opt())
                 } else {
                     None
                 }
@@ -1299,4 +1324,3 @@ impl StaticInterval {
         }
     }
 }
-

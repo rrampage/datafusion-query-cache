@@ -1,0 +1,8 @@
+---
+source: tests/optimizer_tests.rs
+expression: normalize_plan(&physical_plan_cached)
+---
+ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+  AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+    CooperativeExec
+      CachedAggregateExec { interval: TimeInterval { start_ns: 1704067200000000000, end_ns: 1704153600000000000 } }
