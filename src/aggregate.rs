@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Formatter;
@@ -68,6 +67,47 @@ impl<Log: AbstractLog> QCAggregateOptimizerRule<Log> {
 
         None
     }
+
+    fn find_filter_in_plan<'a>(plan: &'a LogicalPlan, temporal_columns: &HashSet<Column>) -> Option<&'a Filter> {
+        match plan {
+            LogicalPlan::Filter(filter) => {
+                if Self::filter_references_temporal_columns(&filter.predicate, temporal_columns) {
+                    Some(filter)
+                } else {
+                    Self::find_filter_in_plan(filter.input.as_ref(), temporal_columns)
+                }
+            }
+            LogicalPlan::Projection(projection) => Self::find_filter_in_plan(projection.input.as_ref(), temporal_columns),
+            LogicalPlan::SubqueryAlias(alias) => Self::find_filter_in_plan(alias.input.as_ref(), temporal_columns),
+            _ => None,
+        }
+    }
+
+    fn filter_references_temporal_columns(expr: &Expr, temporal_columns: &HashSet<Column>) -> bool {
+        match expr {
+            Expr::Column(column) => temporal_columns.contains(column),
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                Self::filter_references_temporal_columns(left, temporal_columns)
+                    || Self::filter_references_temporal_columns(right, temporal_columns)
+            }
+            Expr::Between(between) => {
+                Self::filter_references_temporal_columns(&between.expr, temporal_columns)
+                    || Self::filter_references_temporal_columns(&between.low, temporal_columns)
+                    || Self::filter_references_temporal_columns(&between.high, temporal_columns)
+            }
+            Expr::Not(inner) | Expr::Negative(inner) => {
+                Self::filter_references_temporal_columns(inner, temporal_columns)
+            }
+            Expr::ScalarFunction(func) => func
+                .args
+                .iter()
+                .any(|arg| Self::filter_references_temporal_columns(arg, temporal_columns)),
+            Expr::Cast(cast) => {
+                Self::filter_references_temporal_columns(&cast.expr, temporal_columns)
+            }
+            _ => false,
+        }
+    }
 }
 impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
     fn name(&self) -> &str {
@@ -122,24 +162,25 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
 
         println!("BBBB TEMPORALCOLUMN: {:?}", &self.config.default_temporal_column());
 
-        let (interval, input, temporal_columns_for_param) = if let LogicalPlan::Filter(filter) = &agg_input {
-            let needle_columns = if let Some(temporal_group_by) = &temporal_group_by {
-                Cow::Owned(HashSet::from([temporal_group_by.clone()]))
-            } else {
-                Cow::Borrowed(&self.config.temporal_columns)
-            };
+        let filter_temporal_columns = if let Some(temporal_group_by) = &temporal_group_by {
+            HashSet::from([temporal_group_by.clone()])
+        } else {
+            self.config.temporal_columns.clone()
+        };
 
-            let interval = match StaticInterval::find(&filter.predicate, &needle_columns) {
+        let filter_opt = Self::find_filter_in_plan(&agg_input, &filter_temporal_columns);
+
+        let (interval, input, temporal_columns_for_param) = if let Some(filter) = filter_opt {
+            let interval = match StaticInterval::find(&filter.predicate, &filter_temporal_columns) {
                 StaticInterval::Found(interval) => Some(interval),
                 StaticInterval::Stable => None,
                 _ => {
-                    // we found an unstable expression, we can't rewrite the plan
                     self.log
                         .info(&fingerprint, "we found an unstable expression, caching not possible")?;
                     return Ok(Transformed::no(plan));
                 }
             };
-            (interval, filter.input.as_ref().clone(), needle_columns.into_owned())
+            (interval, filter.input.as_ref().clone(), filter_temporal_columns.clone())
         } else {
             (None, agg_input.clone(), HashSet::new())
         };
@@ -162,12 +203,13 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             // Find the TableScan through Filter/Projection nodes
             let mut current_plan = input.clone();
             let scan = loop {
-                match &current_plan {
-                    LogicalPlan::TableScan(scan) => break Some(scan.clone()),
-                    LogicalPlan::Filter(filter) => current_plan = filter.input.as_ref().clone(),
-                    LogicalPlan::Projection(proj) => current_plan = proj.input.as_ref().clone(),
-                    _ => break None,
-                }
+            match &current_plan {
+                LogicalPlan::TableScan(scan) => break Some(scan.clone()),
+                LogicalPlan::Filter(filter) => current_plan = filter.input.as_ref().clone(),
+                LogicalPlan::Projection(proj) => current_plan = proj.input.as_ref().clone(),
+                LogicalPlan::SubqueryAlias(alias) => current_plan = alias.input.as_ref().clone(),
+                _ => break None,
+            }
             };
 
             let Some(scan) = scan else {
@@ -554,6 +596,7 @@ fn extract_interval_from_logical_plan(plan: &LogicalPlan, temporal_column: &Colu
             // Look through projections
             extract_interval_from_logical_plan(&proj.input, temporal_column)
         }
+        LogicalPlan::SubqueryAlias(alias) => extract_interval_from_logical_plan(alias.input.as_ref(), temporal_column),
         _ => None,
     }
 }
@@ -1253,7 +1296,7 @@ impl StaticInterval {
                     _ => Self::Abandon,
                 };
             }
-            _ => return Self::Abandon,
+            _ => {}
         }
 
         // For other operators, check both sides
