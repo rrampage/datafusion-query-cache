@@ -1,19 +1,23 @@
 [package]
 name = "datafusion-query-cache"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 
 [dependencies]
 async-trait = "0.1.83"
+chrono = "0.4.38"
 #datafusion = "42.0.0"
-datafusion =  {git = "https://github.com/apache/datafusion.git"}
+#datafusion =  {git = "https://github.com/apache/datafusion.git"}
+datafusion = "50.3.0"
 futures = "0.3.31"
+regex = "1.10.6"
 # TODo this hsould be feature flagged
 termcolor = "1.4.1"
+tokio = { version = "1.48.0", features = ["full"] }
 
 [dev-dependencies]
-chrono = "0.4.38"
-tokio = { version = "1.40.0", features = ["full"] }
+datafusion-common = "50.3.0"
+insta = { version = "1.44", features = ["yaml"] }
 
 [lints.clippy]
 dbg_macro = "deny"

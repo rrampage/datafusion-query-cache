@@ -13,9 +13,14 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 
+pub use aggregate::{
+    CacheUpdateAggregateExec, CachedAggregateExec, normalize_temporal_bounds_in_expr, normalize_temporal_bounds_in_plan,
+};
 use aggregate::{QCAggregateExecPlanner, QCAggregateOptimizerRule};
-pub use cache::MemoryQueryCache;
-use cache::QueryCache;
+pub use cache::{
+    MemoryQueryCache, OccupiedIntervalCacheEntry, QueryCache, TimeInterval, normalize_fingerprint_for_caching,
+    print_cache_state,
+};
 pub use log::{LogNoOp, LogStderrColors};
 
 #[derive(Debug)]

@@ -1,0 +1,8 @@
+---
+source: tests/optimizer_tests.rs
+expression: normalize_plan(&logical_plan)
+---
+Projection: count(Int64(1)) AS count(*) [count(*):Int64]
+  Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]] [count(Int64(1)):Int64]
+    Filter: test_table.timestamp >= Utf8("TIMESTAMP_PLACEHOLDER") AND test_table.timestamp < Utf8("TIMESTAMP_PLACEHOLDER") [timestamp:Timestamp(Microsecond, None), service:Utf8, value:Int64]
+      TableScan: test_table [SCHEMA_NORMALIZED]

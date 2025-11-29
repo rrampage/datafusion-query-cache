@@ -1,0 +1,16 @@
+---
+source: tests/optimizer_tests.rs
+expression: normalize_plan(&physical_plan_after_overlap)
+---
+ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+  AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+    CoalescePartitionsExec
+      UnionExec
+        CooperativeExec
+          CachedAggregateExec { interval: TimeInterval { start_ns: 1704067200000000000, end_ns: 1704110400000000000 } }
+        CacheUpdateAggregateExec { interval: TimeInterval { start_ns: 1704110400000000000, end_ns: 1704153600000000000 }, input: CoalescePartitionsExec }
+          CoalescePartitionsExec
+            AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+              CoalesceBatchesExec: target_batch_size=8192
+                FilterExec: timestamp@0 >= 1704067200000000 AND timestamp@0 < 1704153600000000 AND timestamp@0 >= 1704110400000000 AND timestamp@0 < 1704153600000000
+                  DataSourceExec: file_groups={1 group: [[Users/rr/Code/bitmage/truefoundry/datafusion-query-cache/tests/data/query_cache_test_table.csv]]}, projection=[timestamp], file_type=csv, has_header=true
